@@ -1,0 +1,100 @@
+EDGEFS(1)
+===========
+Michal Suchanek <hramrach@centrum.cz>
+Modified by Nexenta Systems, Inc to add support for EdgeX API
+
+
+NAME
+----
+edgefs - mount a file from a http server into the filesystem
+
+
+SYNOPSIS
+--------
+*edgefs* ['OPTIONS'] 'URL' 'FUSE-OPTIONS'
+
+
+DESCRIPTION
+-----------
+edgefs is a *FUSE* based filesystem for mounting http or https URLS as files in
+the filesystem. There is no notion of listable directories in API so only a
+single URL can be mounted.
+
+
+OPTIONS
+-------
+
+*-c 'console'*::
+    Attempt to use the file or device 'console' for output after fork.
+    The default is '/dev/console'.
+
+*-f*::
+    Do not fork, stay in foreground.
+
+*-r 'retries'*::
+    (if 'ECONNRESET' is defined) Retry connecting to server after receiving
+    'ECONNRESET'. Defaults to 8 times which gives about 30s timeout.
+
+*-t 'timeout'*::
+    Use different timeout for connections. Default '30's.
+
+SSL OPTIONS
+~~~~~~~~~~~
+Available when SSL support is compiled in.
+
+*-2*::
+    Allow server certificates signed with RSA-MD2 (strongly discouraged)
+
+*-5*::
+    Allow server certificates signed with RSA-MD5 (discouraged)
+
+*-a 'CA file'*::
+    Specify a file to load trusted CA root certificates from.
+    A default location is set at build time.
+
+*-d 'n'*::
+    Set GnuTLS debug level to numeric value n.
+
+*'URL'*
+~~~~~~~
+The url should specify the protocol as http or https, and it may specify basic
+authentication username and password. Currently special characters like
+whitespace are not handled so the URL cannot contain them.  See a sample URL
+below:
+
+      http://user:password@server.com/dir/file
+
+*'FUSE-OPTIONS'*
+~~~~~~~~~~~~~~~~
+These options are passed to the *FUSE* library. At the very least the mount point should be specified.
+
+
+EXIT STATUS
+-----------
+*0*::
+    Successfully connected to the server
+
+*other*::
+    Failure (url parsing error, server error, FUSE setup error).
+    Some FUSE errors may happen only after the process forks so they will not be returned in exit value.
+
+
+BUGS
+----
+The process can be stopped by typing ^Z on the terminal which may not be desirable under some circumstances.
+
+
+
+AUTHORS
+-------
+ Miklos Szeredi <miklos@szeredi.hu>
+ hmb  marionraven at users.sourceforge.net
+ Michal Suchanek <hramrach@centrum.cz>
+ Nexenta Systems, Inc
+
+
+COPYING
+-------
+Free use of this software is granted under the terms of the GNU General Public
+License (GPL).
+

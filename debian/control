@@ -1,0 +1,20 @@
+Source: edgefs
+Section: web
+Priority: extra
+Maintainer: Nexenta <support@nexenta.com>
+Build-Depends:
+ debhelper (>= 9~), dh-exec,
+ asciidoc, xmlto,
+ libfuse-dev (>> 2.6), pkg-config,
+ libgnutls-dev (>= 2.10~) | libgnutls28-dev,
+Standards-Version: 3.8.4
+Homepage: http://github.com/Nexenta/edge-fuse/
+
+Package: edgefs
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends},
+Recommends: fuse-utils | fuse (>= 2.9.3~)
+Description: FUSE filesystem for mounting files from http servers
+ edgefs is a FUSE based filesystem for mounting http or https URLS as files in
+ the filesystem. There is no notion of listable directories in Edge API so only
+ a single URL can be mounted.
