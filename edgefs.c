@@ -59,8 +59,7 @@
 #include <sys/syscall.h>
 
 #include <pthread.h>
-static pthread_key_t url_key;
-#define FUSE_LOOP fuse_session_loop
+#define FUSE_LOOP fuse_session_loop_mt
 
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
@@ -129,6 +128,7 @@ typedef struct url {
 	time_t last_modified;
 	char tname[TNAME_LEN + 1];
 	char *sid;
+	pthread_mutex_t sid_mutex;
 } struct_url;
 
 static struct_url main_url;
@@ -144,7 +144,7 @@ struct dirbuf {
 };
 
 static off_t get_stat(struct_url*, struct stat * stbuf);
-static ssize_t get_data(struct_url*, off_t start, size_t size);
+static ssize_t get_data(struct_url*, off_t start, size_t size, char *dest);
 static ssize_t post_data(struct_url *url, const char *data, off_t start, size_t size);
 static ssize_t list_data(struct_url *url, off_t off, size_t size,
     fuse_req_t req, struct dirbuf *b);
@@ -321,6 +321,7 @@ static struct_url * create_url_copy(const struct_url * url, char *newname)
 #endif
 	memset(res->tname, 0, TNAME_LEN + 1);
 	snprintf(res->tname, TNAME_LEN, "%0*lX", TNAME_LEN, pthread_self());
+	pthread_mutex_init((pthread_mutex_t *)&url->sid_mutex, NULL);
 	return res;
 }
 
@@ -512,26 +513,14 @@ static void edgefs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 		return;
 	}
 
-	/* since we have to return all stuff requested the buffer cannot be
-	 * allocated in advance */
-	if (url->req_buf
-	    && ( (url->req_buf_size < size)
-		    || ( (url->req_buf_size > size)
-			    && (url->req_buf_size > MAX_REQUEST)))) {
-		free(url->req_buf);
-		url->req_buf = 0;
-	}
-	if (!url->req_buf) {
-		url->req_buf_size = size;
-		url->req_buf = malloc(size);
-	}
-
-	if ((res = get_data(url, off, size)) < 0) {
+	char *out_buf = malloc(size);
+	if ((res = get_data(url, off, size, out_buf)) < 0) {
 		assert(errno);
 		fuse_reply_err(req, errno);
 	} else {
-		fuse_reply_buf(req, url->req_buf, (size_t)res);
+		fuse_reply_buf(req, out_buf, (size_t)res);
 	}
+	free(out_buf);
 }
 
 static void edgefs_write(fuse_req_t req, fuse_ino_t ino,
@@ -1023,6 +1012,7 @@ static int free_url(struct_url* url)
 	if (url->auth) free(url->auth);
 	url->auth = 0;
 #endif
+	pthread_mutex_destroy(&url->sid_mutex);
 	url->port = 0;
 	url->proto = 0; /* only after socket closed */
 	url->file_size=0;
@@ -1291,7 +1281,6 @@ int main(int argc, char *argv[])
 	}
 
 	close_client_force(&main_url); /* each thread should open its own socket */
-	pthread_key_create(&url_key, &destroy_url_copy);
 
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 	struct fuse_chan *ch;
@@ -1653,6 +1642,7 @@ static int open_client_socket(struct_url *url) {
 		}
 		url->ssl_connected = 1; /* Prevent printing cert data over and over again */
 	}
+	trace("%s: connected to %s port %i, sockfd %d\n", url->tname, url->host, url->port, url->sockfd);
 	return url->sock_type = SOCK_OPEN;
 }
 
@@ -2045,11 +2035,16 @@ req:
  * to determine the file size
  */
 
-static off_t get_stat(struct_url *url, struct stat * stbuf) {
+static off_t get_stat(struct_url *url, struct stat * stbuf)
+{
 	char buf[HEADER_SIZE];
+	ssize_t bytes;
 
 	trace("name=%s sid=%s\n", url->name, url->sid);
-	if (exchange(url, buf, "HEAD", &(url->file_size), 0, 0, 0, NULL, "streamsession") < 0)
+	pthread_mutex_lock(&tab_mutex);
+	bytes = exchange(url, buf, "HEAD", &(url->file_size), 0, 0, 0, NULL, "streamsession");
+	pthread_mutex_unlock(&tab_mutex);
+	if (bytes < 0)
 		return -1;
 
 	close_client_socket(url);
@@ -2064,19 +2059,22 @@ static off_t get_stat(struct_url *url, struct stat * stbuf) {
  * allows to read arbitrary bytes
  */
 
-static ssize_t get_data(struct_url *url, off_t start, size_t size)
+static ssize_t get_data(struct_url *url, off_t start, size_t size, char *destination)
 {
 	char buf[HEADER_SIZE];
 	const char *b;
 	ssize_t bytes;
 	off_t end = start + (off_t)size - 1;
-	char *destination = url->req_buf;
 	off_t content_length;
 	size_t header_length;
 
+	pthread_mutex_lock(&url->sid_mutex);
 	bytes = exchange(url, buf, "GET", &content_length,
 	    start, end, &header_length, NULL, "streamsession");
-	if (bytes <= 0) return -1;
+	if (bytes <= 0) {
+		pthread_mutex_unlock(&url->sid_mutex);
+		return -1;
+	}
 
 	trace("content_length %ld size %ld sid=%s\n", content_length, size, url->sid);
 	if (content_length != size) {
@@ -2095,6 +2093,7 @@ static ssize_t get_data(struct_url *url, off_t start, size_t size)
 
 		bytes = read_client_socket(url, destination, size);
 		if (bytes < 0) {
+			pthread_mutex_unlock(&url->sid_mutex);
 			errno_report("GET (read)");
 			return -1;
 		}
@@ -2102,6 +2101,7 @@ static ssize_t get_data(struct_url *url, off_t start, size_t size)
 			break;
 		}
 	}
+	pthread_mutex_unlock(&url->sid_mutex);
 
 	close_client_socket(url);
 
@@ -2126,13 +2126,11 @@ static ssize_t post_data(struct_url *url, const char *data, off_t start,
 	trace("sid=%s\n", url->sid);
 	if (size)
 		end = start + (off_t)size - 1;
-//	else if (!url->sid)
-//		return 0;
 
-	pthread_mutex_lock(&tab_mutex);
+	pthread_mutex_lock(&url->sid_mutex);
 	res = exchange(url, buf, "POST", &content_length,
 	    start, end, &header_length, data, "streamsession");
-	pthread_mutex_unlock(&tab_mutex);
+	pthread_mutex_unlock(&url->sid_mutex);
 	if (res <= 0)
 		return -1;
 
@@ -2154,8 +2152,10 @@ static int del_data(struct_url *url)
 
 	trace("sid=%s\n", url->sid);
 
+	pthread_mutex_lock(&tab_mutex);
 	if (exchange(url, buf, "DELETE", &content_length, 0, 0, 0, NULL, "streamsession") < 0)
 		return -1;
+	pthread_mutex_unlock(&tab_mutex);
 
 	close_client_socket(url);
 
@@ -2178,9 +2178,13 @@ static ssize_t list_data(struct_url *url, off_t off, size_t size,
 	char *destination = url->req_buf;
 	const char *b;
 
+	pthread_mutex_lock(&tab_mutex);
 	bytes = exchange(url, buf, "GET", &content_length,
 	    off, end, &header_length, NULL, "kv");
-	if (bytes <= 0) return -1;
+	if (bytes <= 0) {
+		pthread_mutex_unlock(&tab_mutex);
+		return -1;
+	}
 
 	trace("hdr_len=%ld content_len=%ld off=%ld size=%ld bytes=%ld\n",
 	    header_length, content_length, off, size, bytes);
@@ -2199,6 +2203,7 @@ static ssize_t list_data(struct_url *url, off_t off, size_t size,
 		bytes = read_client_socket(url, destination, size);
 		trace("read extra %ld bytes\n", bytes);
 		if (bytes < 0) {
+			pthread_mutex_unlock(&tab_mutex);
 			errno_report("GET (read)");
 			return -1;
 		}
@@ -2206,6 +2211,7 @@ static ssize_t list_data(struct_url *url, off_t off, size_t size,
 			break;
 		}
 	}
+	pthread_mutex_unlock(&tab_mutex);
 
 	close_client_socket(url);
 
