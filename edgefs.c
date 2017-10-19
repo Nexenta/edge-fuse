@@ -30,13 +30,17 @@
 
 #define FUSE_USE_VERSION 26
 
+#define _GNU_SOURCE
+#define __USE_GNU
+
 #include <fuse_lowlevel.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <unistd.h>
+#include <sys/types.h>
+#include <stdarg.h>
 #include <assert.h>
 #include <ctype.h>
 #include <sys/stat.h>
@@ -50,19 +54,16 @@
 #include <stddef.h>
 #include <inttypes.h>
 #include <linux/tcp.h>
+#include <search.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
-#ifdef USE_THREAD
 #include <pthread.h>
 static pthread_key_t url_key;
-#define FUSE_LOOP fuse_session_loop_mt
-#else
 #define FUSE_LOOP fuse_session_loop
-#endif
 
-#ifdef USE_SSL
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
-#endif
 
 /*
  * ECONNRESET happens with some dodgy servers so may need to handle that.
@@ -80,6 +81,7 @@ static pthread_key_t url_key;
 #define TNAME_LEN 13
 #define RESET_RETRIES 8
 #define VERSION "1.0.0 \"Edge-X API client\""
+#define BUCKET_MAX 1000000
 
 enum sock_state {
 	SOCK_CLOSED,
@@ -113,8 +115,7 @@ typedef struct url {
 	int redirected;
 	int redirect_followed;
 	int redirect_depth;
-#ifdef USE_SSL
-	long ssl_log_level;
+	long log_level;
 	unsigned md5;
 	unsigned md2;
 	int ssl_initialized;
@@ -122,7 +123,6 @@ typedef struct url {
 	gnutls_certificate_credentials_t sc;
 	gnutls_session_t ss;
 	const char *cafile;
-#endif
 	char *req_buf;
 	size_t req_buf_size;
 	off_t file_size;
@@ -134,20 +134,68 @@ typedef struct url {
 static struct_url main_url;
 static char* argv0;
 
+/* this only works on 64-bit platforms */
+#define INODE_TO_URL(_ino) ((struct_url*)(_ino))
+#define URL_TO_INODE(_u) ((uint64_t)(_u))
+
+struct dirbuf {
+	char *p;
+	size_t size;
+};
+
 static off_t get_stat(struct_url*, struct stat * stbuf);
 static ssize_t get_data(struct_url*, off_t start, size_t size);
 static ssize_t post_data(struct_url *url, const char *data, off_t start, size_t size);
+static ssize_t list_data(struct_url *url, off_t off, size_t size,
+    fuse_req_t req, struct dirbuf *b);
+static int del_data(struct_url *url);
 static int open_client_socket(struct_url *url);
 static int close_client_socket(struct_url *url);
 static int close_client_force(struct_url *url);
-static struct_url * thread_setup(void);
 static void destroy_url_copy(void *);
 
 /* Protocol symbols. */
 #define PROTO_HTTP 0
-#ifdef USE_SSL
 #define PROTO_HTTPS 1
-#endif
+
+static void
+http_report(const char *reason, const char *method,
+    const char *buf, size_t len)
+{
+	fprintf(stderr, "HTTP %s: %s\n", method, reason);
+	fwrite(buf, len, 1, stderr);
+	if (len && ( *(buf+len-1) != '\n')) fputc('\n', stderr);
+}
+
+static void
+trace_a(const char *fmt, ...)
+{
+	va_list ap;
+	char msg[2048];
+	struct timeval tp;
+	long pid = getpid();
+	long thrid = syscall(SYS_gettid);
+	time_t meow = time(NULL);
+	char buf[64];
+	struct tm tm;
+
+	gettimeofday(&tp, 0);
+
+	strftime(buf, sizeof (buf), "%Y-%m-%d %H:%M:%S", localtime_r(&meow, &tm));
+
+	va_start(ap, fmt);
+	vsnprintf(msg, sizeof (msg), fmt, ap);
+	fprintf(stderr, "[%lu.%lu] %c, %s.%03d : %s", pid, thrid,
+	    'T', buf, (int)(tp.tv_usec/1000), msg);
+	va_end(ap);
+}
+#define trace(fmt, ...) do { \
+	while (0) { fprintf(NULL, fmt, ##__VA_ARGS__); } \
+	if (main_url.log_level) { \
+		trace_a("%14s:%-4d : " fmt, __FILE__, __LINE__, \
+			##__VA_ARGS__); \
+	} \
+} while (0)
 
 #ifdef USE_AUTH
 
@@ -214,34 +262,113 @@ static char *b64_encode(unsigned const char* ptr, long len) {
 
 #endif /* USE_AUTH */
 
+pthread_mutex_t tab_mutex;
+struct hsearch_data tab = {0};
+
+void hadd(struct hsearch_data *tab, char *key, fuse_ino_t ino)
+{
+	ENTRY item = {key, (void *)ino};
+	ENTRY *pitem = &item;
+
+	pthread_mutex_lock(&tab_mutex);
+	if (hsearch_r(item, ENTER, &pitem, tab)) {
+		pitem->data = (void *) ino;
+	}
+	pthread_mutex_unlock(&tab_mutex);
+}
+
+void hdelete(struct hsearch_data *tab, char *key)
+{
+	ENTRY item = {key};
+	ENTRY *pitem = &item;
+
+	pthread_mutex_lock(&tab_mutex);
+	if (hsearch_r(item, FIND, &pitem, tab)) {
+		pitem->data = (void *) NULL;
+	}
+	pthread_mutex_unlock(&tab_mutex);
+}
+
+fuse_ino_t hfind(struct hsearch_data *tab, char *key)
+{
+	ENTRY item = {key};
+	ENTRY *pitem = &item;
+
+	pthread_mutex_lock(&tab_mutex);
+	if (hsearch_r(item, FIND, &pitem, tab)) {
+		pthread_mutex_unlock(&tab_mutex);
+		return (fuse_ino_t) pitem->data;
+	}
+	pthread_mutex_unlock(&tab_mutex);
+	return (fuse_ino_t)NULL;
+}
+
+static struct_url * create_url_copy(const struct_url * url, char *newname)
+{
+	struct_url * res = calloc(1, sizeof(struct_url));
+	memcpy(res, url, sizeof(struct_url));
+	if (url->name)
+		res->name = strdup(url->name);
+	if (url->host)
+		res->host = strdup(url->host);
+	if (url->path)
+		res->path = strdup(url->path);
+	if (url->sid && newname && strcmp(newname, url->name) == 0)
+		res->sid = strdup(url->sid);
+#ifdef USE_AUTH
+	if (url->auth)
+		res->auth = strdup(url->auth);
+#endif
+	memset(res->tname, 0, TNAME_LEN + 1);
+	snprintf(res->tname, TNAME_LEN, "%0*lX", TNAME_LEN, pthread_self());
+	return res;
+}
+
+fuse_ino_t newino(char *name)
+{
+	fuse_ino_t ino;
+
+	ino = hfind(&tab, name);
+	if (ino)
+		return ino;
+
+	struct_url *res = create_url_copy(&main_url, name);
+	if (res->name)
+		free(res->name);
+	res->name = strdup(name);
+	ino = URL_TO_INODE(res);
+	hadd(&tab, name, ino);
+	return ino;
+}
+
 /*
  * The FUSE operations originally ripped from the hello_ll sample.
  */
 
-static int edgefs_stat(fuse_ino_t ino, struct stat *stbuf)
+static int edgefs_stat(fuse_ino_t ino, struct fuse_file_info *fi,
+    struct stat *stbuf)
 {
-	printf("here0 stat\n");
+	int res;
+
+	trace("ino=%lx\n", ino);
 	stbuf->st_ino = ino;
-	switch (ino) {
-	case 1:
+
+	if (ino == 1) {
 		stbuf->st_mode = S_IFDIR | 0755;
 		stbuf->st_nlink = 2;
-		break;
-
-	case 2: {
-			struct_url * url = thread_setup();
-			fprintf(stderr, "%s: %s: stat()\n", argv0, url->tname); /*DEBUG*/
-			stbuf->st_mode = S_IFREG | 0644;
-			stbuf->st_nlink = 1;
-			return (int) (get_stat(url, stbuf) == -1) ? -1 : 0;
-		}
-		break;
-
-	default:
-		errno = ENOENT;
-		return -1;
+		return 0;
 	}
-	return 0;
+
+	struct_url *url = fi ?
+		(struct_url *)fi->fh : create_url_copy(INODE_TO_URL(ino), NULL);
+
+	stbuf->st_mode = S_IFREG | 0644;
+	stbuf->st_nlink = 1;
+
+	res = (get_stat(url, stbuf) == -1) ? -1 : 0;
+	if (!fi)
+		destroy_url_copy(url);
+	return res;
 }
 
 static void edgefs_getattr(fuse_req_t req, fuse_ino_t ino,
@@ -251,9 +378,9 @@ static void edgefs_getattr(fuse_req_t req, fuse_ino_t ino,
 
 	(void) fi;
 
-	printf("here1 getattr\n");
+	trace("getattr ino=%lx\n", ino);
 	memset(&stbuf, 0, sizeof(stbuf));
-	if (edgefs_stat(ino, &stbuf) < 0)
+	if (edgefs_stat(ino, fi, &stbuf) < 0)
 		assert(errno),fuse_reply_err(req, errno);
 	else
 		fuse_reply_attr(req, &stbuf, 1.0);
@@ -266,12 +393,12 @@ static void edgefs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 	e.attr_timeout = 1.0;
 	e.entry_timeout = 1.0;
 
-	printf("here2 lookup\n");
-	if (parent != 1 || strcmp(name, main_url.name) != 0) {
+	trace("lookup %s\n", name);
+	if (parent != 1) {
 		e.ino = 0;
 	} else {
-		e.ino = 2;
-		if (edgefs_stat(e.ino, &e.attr) < 0) {
+		e.ino = newino((char*)name);
+		if (edgefs_stat(e.ino, NULL, &e.attr) < 0) {
 			assert(errno);
 			fuse_reply_err(req, errno);
 			return;
@@ -280,11 +407,6 @@ static void edgefs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 	}
 	fuse_reply_entry(req, &e);
 }
-
-struct dirbuf {
-	char *p;
-	size_t size;
-};
 
 static void dirbuf_add(fuse_req_t req, struct dirbuf *b, const char *name,
     fuse_ino_t ino)
@@ -317,35 +439,59 @@ static void edgefs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
     off_t off, struct fuse_file_info *fi)
 {
 	(void) fi;
+	struct dirbuf b;
+	ssize_t res;
 
-	printf("here3 readdir\n");
-	if (ino != 1)
+	trace("readdir ino=%lx\n", ino);
+	if (ino != 1) {
 		fuse_reply_err(req, ENOTDIR);
-	else {
-		struct dirbuf b;
-
-		memset(&b, 0, sizeof(b));
-		dirbuf_add(req, &b, ".", 1);
-		dirbuf_add(req, &b, "..", 1);
-		dirbuf_add(req, &b, main_url.name, 2);
-		reply_buf_limited(req, b.p, b.size, off, size);
-		free(b.p);
+		return;
 	}
+
+	struct_url *url = create_url_copy(&main_url, NULL);
+
+	if (url->req_buf
+	    && ( (url->req_buf_size < size)
+		    || ( (url->req_buf_size > size)
+			    && (url->req_buf_size > MAX_REQUEST)))) {
+		free(url->req_buf);
+		url->req_buf = 0;
+	}
+	if (!url->req_buf) {
+		url->req_buf_size = size;
+		url->req_buf = malloc(size);
+	}
+
+	memset(&b, 0, sizeof(b));
+	dirbuf_add(req, &b, ".", 1);
+	dirbuf_add(req, &b, "..", 1);
+
+	if ((res = list_data(url, off, size, req, &b)) < 0) {
+		free(b.p);
+		fuse_reply_err(req, EIO);
+		return;
+	}
+
+	reply_buf_limited(req, b.p, b.size, off, size);
+	free(b.p);
 }
 
 static void edgefs_open(fuse_req_t req, fuse_ino_t ino,
     struct fuse_file_info *fi)
 {
-	printf("here4 open\n");
-	if (ino != 2)
+	trace("open %lx\n", ino);
+	if (ino == 1)
 		fuse_reply_err(req, EISDIR);
 	else {
-		/* direct_io is supposed to allow partial reads. However, setting
-		 * the flag causes read length max at 4096 bytes which leads to
-		 * *many* requests, poor performance, and errors. Some resources
-		 * like TCP ports are recycled too fast for Linux to cope.
-		 */
-		//fi->direct_io = 1;
+		struct_url *url = create_url_copy(INODE_TO_URL(ino), NULL);
+		int fd = open_client_socket(url);
+		if (fd < 0) {
+			destroy_url_copy(url);
+			fuse_reply_err(req, EIO);
+			return;
+		}
+		url->sock_type = SOCK_KEEPALIVE;
+		fi->fh = (uint64_t)url;
 		fuse_reply_open(req, fi);
 	}
 }
@@ -355,15 +501,9 @@ static void edgefs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 {
 	(void) fi;
 
-	printf("here5 read\n");
-	struct_url * url = thread_setup();
+	trace("read ino=%lx\n", ino);
+	struct_url *url = (struct_url *)fi->fh;
 	ssize_t res;
-
-	assert(ino == 2);
-
-	assert(url->file_size >= off);
-
-	size=min(size, (size_t)(url->file_size - off));
 
 	if (url->file_size == off) {
 		/* Handling of EOF is not well documented, returning EOF as error
@@ -371,6 +511,7 @@ static void edgefs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 		fuse_reply_buf(req, NULL,  0);
 		return;
 	}
+
 	/* since we have to return all stuff requested the buffer cannot be
 	 * allocated in advance */
 	if (url->req_buf
@@ -398,11 +539,9 @@ static void edgefs_write(fuse_req_t req, fuse_ino_t ino,
 {
 	(void) fi;
 
-	printf("here6 write\n");
-	struct_url * url = thread_setup();
+	trace("write ino=%lx\n", ino);
+	struct_url *url = (struct_url *)fi->fh;
 	ssize_t res;
-
-	assert(ino == 2);
 
 	res = post_data(url, data, off, size);
 	if (res < 0)
@@ -416,11 +555,9 @@ static void edgefs_flush(fuse_req_t req, fuse_ino_t ino,
 {
 	(void) fi;
 
-	printf("here7 flush\n");
-	struct_url * url = thread_setup();
+	trace("flush ino=%lx\n", ino);
+	struct_url *url = (struct_url *)fi->fh;
 	ssize_t res;
-
-	assert(ino == 2);
 
 	res = post_data(url, NULL, 0, 0);
 	if (res < 0)
@@ -434,17 +571,16 @@ static void edgefs_release(fuse_req_t req, fuse_ino_t ino,
 {
 	(void) fi;
 
-	printf("here7 release\n");
-	struct_url * url = thread_setup();
+	trace("release ino=%lx\n", ino);
+	struct_url *url = (struct_url *)fi->fh;
 	ssize_t res;
-
-	assert(ino == 2);
 
 	res = post_data(url, NULL, 0, 0);
 	if (res < 0)
 		fuse_reply_err(req, EIO);
 	else
 		fuse_reply_err(req, 0);
+	destroy_url_copy(url);
 }
 
 static void edgefs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
@@ -452,11 +588,9 @@ static void edgefs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
 {
 	(void) fi;
 
-	printf("here8 fsync\n");
-	struct_url * url = thread_setup();
+	trace("fsync ino=%lx\n", ino);
+	struct_url *url = (struct_url *)fi->fh;
 	ssize_t res;
-
-	assert(ino == 2);
 
 	res = post_data(url, NULL, 0, 0);
 	if (res < 0)
@@ -468,23 +602,36 @@ static void edgefs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
 static void edgefs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
     mode_t mode, struct fuse_file_info *fi)
 {
+	ssize_t res;
 	struct fuse_entry_param e;
+	memset(&e, 0, sizeof(e));
 
-	printf("here9 create parent %ld name %s\n", parent, name);
+	trace("create parent %ld name %s\n", parent, name);
 	struct stat st;
-	get_stat(&main_url, &st);
+	memset(&st, 0, sizeof(st));
 
-	/* direct_io is supposed to allow partial reads. However, setting
-	 * the flag causes read length max at 4096 bytes which leads to
-	 * *many* requests, poor performance, and errors. Some resources
-	 * like TCP ports are recycled too fast for Linux to cope.
-	 */
-	//fi->direct_io = 1;
-	e.ino = 2;
-	e.generation = 0;
+	e.ino = newino((char*)name);
+
+	struct_url *url = create_url_copy(INODE_TO_URL(e.ino), NULL);
+	int fd = open_client_socket(url);
+	if (fd < 0) {
+		destroy_url_copy(url);
+		fuse_reply_err(req, EIO);
+		return;
+	}
+	url->sock_type = SOCK_KEEPALIVE;
+	fi->fh = (uint64_t)url;
+
+	res = post_data(url, "", 0, 0);
+	if (res < 0) {
+		fuse_reply_err(req, EIO);
+		return;
+	}
+	st.st_mode = S_IFREG | 0644;
+	st.st_nlink = 1;
+	st.st_mtime = url->last_modified;
+	st.st_size = url->file_size;
 	e.attr = st;
-	e.attr_timeout = 0;
-	e.entry_timeout = 0;
 	fuse_reply_create(req, &e, fi);
 }
 
@@ -495,9 +642,9 @@ static void edgefs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 
 	(void) fi;
 
-	printf("here10 setattr\n");
+	trace("setattr ino=%lx\n", ino);
 	memset(&stbuf, 0, sizeof(stbuf));
-	if (edgefs_stat(ino, &stbuf) < 0)
+	if (edgefs_stat(ino, fi, &stbuf) < 0)
 		assert(errno),fuse_reply_err(req, errno);
 	else
 		fuse_reply_attr(req, &stbuf, 1.0);
@@ -505,8 +652,24 @@ static void edgefs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 
 static void edgefs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
-	printf("here11 unlink %s\n", name);
+	fuse_ino_t ino;
+	trace("unlink %s\n", name);
+
+	ino = hfind(&tab, (char*)name);
+	if (!ino) {
+		fuse_reply_err(req, ENOENT);
+		return;
+	}
+
+	struct_url *url = create_url_copy(INODE_TO_URL(ino), NULL);
+	del_data(url);
 	fuse_reply_err(req, 0);
+}
+
+static void edgefs_forget(fuse_req_t req, fuse_ino_t ino, unsigned long nlookup)
+{
+	trace("forget ino=%lx %s\n", ino, INODE_TO_URL(ino)->name);
+	fuse_reply_none(req);
 }
 
 static struct fuse_lowlevel_ops edgefs_oper = {
@@ -519,6 +682,7 @@ static struct fuse_lowlevel_ops edgefs_oper = {
 	.write              = edgefs_write,
 //	.flush              = edgefs_flush,
 	.release            = edgefs_release,
+	.forget             = edgefs_forget,
 	.fsync              = edgefs_fsync,
 	.create             = edgefs_create,
 	.unlink             = edgefs_unlink,
@@ -554,8 +718,6 @@ static int mempref(const char *mem, const char *pref, size_t size, int case_sens
 	}
 }
 
-#ifdef USE_SSL
-
 static void errno_report(const char *where);
 static void ssl_error(ssize_t error, struct_url * url, const char *where);
 static void ssl_error_p(ssize_t error, struct_url * url, const char *where, const char *extra);
@@ -585,7 +747,7 @@ load_file (const char *file)
 	else {
 		loaded_file.data = ptr;
 		loaded_file.size = (unsigned int) filelen;
-		fprintf(stderr, "Loaded '%s' %ld bytes\n", file, filelen);
+		trace("Loaded '%s' %ld bytes\n", file, filelen);
 		/* fwrite(ptr, filelen, 1, stderr); */
 	}
 	return loaded_file;
@@ -611,14 +773,14 @@ print_ssl_info (gnutls_session_t session)
 	int dhe, ecdh;
 	dhe = ecdh = 0;
 	if (!session) {
-		fprintf(stderr, "No SSL session data.\n");
+		trace("No SSL session data.\n");
 		return 0;
 	}
 	/* print the key exchange’s algorithm name
 	 */
 	kx = gnutls_kx_get (session);
 	tmp = gnutls_kx_get_name (kx);
-	fprintf(stderr, "- Key Exchange: %s\n", tmp);
+	trace("- Key Exchange: %s\n", tmp);
 	/* Check the authentication type used and switch
 	 * to the appropriate.
 	 */
@@ -638,44 +800,44 @@ print_ssl_info (gnutls_session_t session)
 		/* cert should have been printed when it was verified */
 		break;
 	default:
-		fprintf(stderr, "Not a x509 sesssion !?!\n");
+		trace("Not a x509 sesssion !?!\n");
 
 	}
 #if (GNUTLS_VERSION_MAJOR > 3)
 	/* switch */
 	if (ecdh != 0)
-		fprintf(stderr, "- Ephemeral ECDH using curve %s\n",
+		trace("- Ephemeral ECDH using curve %s\n",
 		    gnutls_ecc_curve_get_name (gnutls_ecc_curve_get (session)));
 	else
 #endif
 		if (dhe != 0)
-			fprintf(stderr, "- Ephemeral DH using prime of %d bits\n",
+			trace("- Ephemeral DH using prime of %d bits\n",
 			    gnutls_dh_get_prime_bits (session));
 	/* print the protocol’s name (ie TLS 1.0)
 	 */
 	tmp = gnutls_protocol_get_name (gnutls_protocol_get_version (session));
-	fprintf(stderr, "- Protocol: %s\n", tmp);
+	trace("- Protocol: %s\n", tmp);
 	/* print the certificate type of the peer.
 	 * ie X.509
 	 */
 	tmp =
 		gnutls_certificate_type_get_name (gnutls_certificate_type_get (session));
-	fprintf(stderr, "- Certificate Type: %s\n", tmp);
+	trace("- Certificate Type: %s\n", tmp);
 	/* print the compression algorithm (if any)
 	 */
 	tmp = gnutls_compression_get_name (gnutls_compression_get (session));
-	fprintf(stderr, "- Compression: %s\n", tmp);
+	trace("- Compression: %s\n", tmp);
 	/* print the name of the cipher used.
 	 * ie 3DES.
 	 */
 	tmp = gnutls_cipher_get_name (gnutls_cipher_get (session));
-	fprintf(stderr, "- Cipher: %s\n", tmp);
+	trace("- Cipher: %s\n", tmp);
 	/* Print the MAC algorithms name.
 	 * ie SHA1
 	 */
 	tmp = gnutls_mac_get_name (gnutls_mac_get (session));
-	fprintf(stderr, "- MAC: %s\n", tmp);
-	fprintf(stderr, "Note: SSL paramaters may change as new connections are established to the server.\n");
+	trace("- MAC: %s\n", tmp);
+	trace("Note: SSL paramaters may change as new connections are established to the server.\n");
 	return 0;
 }
 
@@ -708,17 +870,17 @@ verify_certificate_callback (gnutls_session_t session)
 		return GNUTLS_E_CERTIFICATE_ERROR;
 	}
 	if (status & GNUTLS_CERT_INVALID)
-		fprintf(stderr, "The server certificate is NOT trusted.\n");
+		trace("The server certificate is NOT trusted.\n");
 	if (status & GNUTLS_CERT_INSECURE_ALGORITHM)
-		fprintf(stderr, "The server certificate uses an insecure algorithm.\n");
+		trace("The server certificate uses an insecure algorithm.\n");
 	if (status & GNUTLS_CERT_SIGNER_NOT_FOUND)
-		fprintf(stderr, "The server certificate hasn’t got a known issuer.\n");
+		trace("The server certificate hasn’t got a known issuer.\n");
 	if (status & GNUTLS_CERT_REVOKED)
-		fprintf(stderr, "The server certificate has been revoked.\n");
+		trace("The server certificate has been revoked.\n");
 	if (status & GNUTLS_CERT_EXPIRED)
-		fprintf(stderr, "The server certificate has expired\n");
+		trace("The server certificate has expired\n");
 	if (status & GNUTLS_CERT_NOT_ACTIVATED)
-		fprintf(stderr, "The server certificate is not yet activated\n");
+		trace("The server certificate is not yet activated\n");
 	/* Up to here the process is the same for X.509 certificates and
 	 * OpenPGP keys. From now on X.509 certificates are assumed. This can
 	 * be easily extended to work with openpgp keys as well.
@@ -744,7 +906,7 @@ verify_certificate_callback (gnutls_session_t session)
 		return GNUTLS_E_CERTIFICATE_ERROR;
 	}
 	if (!(url->ssl_connected)) if (!gnutls_x509_crt_print (cert, GNUTLS_CRT_PRINT_FULL, &data)) {
-		fprintf(stderr, "%s", data.data);
+		trace("%s", data.data);
 		gnutls_free(data.data);
 	}
 	if (!hostname || !gnutls_x509_crt_check_hostname (cert, hostname))
@@ -754,7 +916,7 @@ verify_certificate_callback (gnutls_session_t session)
 			int i;
 			size_t len = strlen(hostname);
 			if (*(hostname+len-1) == '.') len--;
-			if (!(url->ssl_connected)) fprintf(stderr, "Server hostname verification failed. Trying to peek into the cert.\n");
+			if (!(url->ssl_connected)) trace("Server hostname verification failed. Trying to peek into the cert.\n");
 			for (i=0;;i++) {
 				char *dn = NULL;
 				size_t dn_size = 0;
@@ -770,7 +932,7 @@ verify_certificate_callback (gnutls_session_t session)
 						if (len == dn_size)
 							match = ! strncmp(dn, hostname, len);
 						if (match) found = 1;
-						if (!(url->ssl_connected)) fprintf(stderr, "Cert CN(%i): %s: %c\n", i, dn, match?'*':'X');
+						if (!(url->ssl_connected)) trace("Cert CN(%i): %s: %c\n", i, dn, match?'*':'X');
 					}}
 				else
 					ssl_error(dn_ret, url, "getting cert subject data");
@@ -780,7 +942,7 @@ verify_certificate_callback (gnutls_session_t session)
 			}
 		}
 		if (!found) {
-			fprintf(stderr, "The server certificate’s owner does not match hostname ’%s’\n",
+			trace("The server certificate’s owner does not match hostname ’%s’\n",
 			    hostname);
 			return GNUTLS_E_CERTIFICATE_ERROR;
 		}
@@ -810,7 +972,7 @@ static void ssl_error_p(ssize_t error, struct_url * url, const char *where, cons
 	else
 		err_desc = gnutls_strerror((int)error);
 
-	fprintf(stderr, "%s: %s: %s: %s%zd %s.\n", argv0, url->tname, where, extra, error, err_desc);
+	fprintf(stderr, "SSL: %s: %s: %s%zd %s.\n", url->tname, where, extra, error, err_desc);
 }
 
 static void ssl_error(ssize_t error, struct_url * url, const char *where)
@@ -819,13 +981,11 @@ static void ssl_error(ssize_t error, struct_url * url, const char *where)
 	/* FIXME try to decode errors more meaningfully */
 	errno = EIO;
 }
-#endif
 
 static void errno_report(const char *where)
 {
-	struct_url * url = thread_setup();
 	int e = errno;
-	fprintf(stderr, "%s: %s: %s: %d %s.\n", argv0, url->tname, where, errno, strerror(errno));
+	fprintf(stderr, "Error: %s: %d %s.\n", where, errno, strerror(errno));
 	errno = e;
 }
 
@@ -845,9 +1005,7 @@ static int init_url(struct_url* url)
 #ifdef RETRY_ON_RESET
 	url->retry_reset = RESET_RETRIES;
 #endif
-#ifdef USE_SSL
 	url->cafile = CERT_STORE;
-#endif
 	return 0;
 }
 
@@ -879,13 +1037,10 @@ static void print_url(FILE *f, const struct_url * url)
 	case PROTO_HTTP:
 		protocol = "http";
 		break;;
-#ifdef USE_SSL
 	case PROTO_HTTPS:
 		protocol = "https";
 		break;;
-#endif
 	}
-	fprintf(f, "file name: \t%s\n", url->name);
 	fprintf(f, "host name: \t%s\n", url->host);
 	fprintf(f, "port number: \t%d\n", url->port);
 	fprintf(f, "protocol: \t%s\n", protocol);
@@ -900,9 +1055,7 @@ static int parse_url(char *_url, struct_url* res, enum url_flags flag)
 	const char *url_orig;
 	const char *url;
 	const char *http = "http://";
-#ifdef USE_SSL
 	const char *https = "https://";
-#endif /* USE_SSL */
 	int path_start = '/';
 
 	if (!_url)
@@ -925,20 +1078,16 @@ static int parse_url(char *_url, struct_url* res, enum url_flags flag)
 	url_orig = url = _url;
 
 	close_client_force(res);
-#ifdef USE_SSL
 	res->ssl_connected = 0;
-#endif
 
 	if (strncmp(http, url, strlen(http)) == 0) {
 		url += strlen(http);
 		res->proto = PROTO_HTTP;
 		res->port = 80;
-#ifdef USE_SSL
 	} else if (strncmp(https, url, strlen(https)) == 0) {
 		url += strlen(https);
 		res->proto = PROTO_HTTPS;
 		res->port = 443;
-#endif /* USE_SSL */
 	} else {
 		fprintf(stderr, "Invalid protocol in url: %s\n", url_orig);
 		return -1;
@@ -987,6 +1136,7 @@ static int parse_url(char *_url, struct_url* res, enum url_flags flag)
 		free(res->host);
 	res->host = strndup(url, (size_t)(strchr(url, host_end) - url));
 
+#if 0
 	if (flag != URL_DROP) {
 		/* Get the file name. */
 		url = strchr(url, path_start);
@@ -1008,6 +1158,8 @@ static int parse_url(char *_url, struct_url* res, enum url_flags flag)
 		}
 	} else
 		assert(res->name);
+#endif
+	res->name = strdup("");
 
 	return res->proto;
 }
@@ -1016,19 +1168,13 @@ static void usage(void)
 {
 	fprintf(stderr, "%s >>> Version: %s <<<\n", __FILE__, VERSION);
 	fprintf(stderr, "usage:  %s [-c [console]] "
-#ifdef USE_SSL
 	    "[-a file] [-d n] [-5] [-2] "
-#endif
 	    "[-f] [-t timeout] [-r n] url mount-parameters\n\n", argv0);
-#ifdef USE_SSL
 	fprintf(stderr, "\t -2 \tAllow RSA-MD2 server certificate\n");
 	fprintf(stderr, "\t -5 \tAllow RSA-MD5 server certificate\n");
 	fprintf(stderr, "\t -a \tCA file used to verify server certificate\n\t\t(default: %s)\n", CERT_STORE);
-#endif
 	fprintf(stderr, "\t -c \tuse console for standard input/output/error\n\t\t(default: %s)\n", CONSOLE);
-#ifdef USE_SSL
-	fprintf(stderr, "\t -d \tGNUTLS debug level (default 0)\n");
-#endif
+	fprintf(stderr, "\t -d \tdebug level (default 0)\n");
 	fprintf(stderr, "\t -f \tstay in foreground - do not fork\n");
 #ifdef RETRY_ON_RESET
 	fprintf(stderr, "\t -r \tnumber of times to retry connection on reset\n\t\t(default: %i)\n", RESET_RETRIES);
@@ -1078,7 +1224,6 @@ int main(int argc, char *argv[])
 					  fork_terminal = 0;
 				  }
 				  break;
-#ifdef USE_SSL
 			case '2': main_url.md2 = GNUTLS_VERIFY_ALLOW_SIGN_RSA_MD2;
 				  break;
 			case '5': main_url.md5 = GNUTLS_VERIFY_ALLOW_SIGN_RSA_MD5;
@@ -1086,11 +1231,10 @@ int main(int argc, char *argv[])
 			case 'a': main_url.cafile = argv[1];
 				  shift;
 				  break;
-			case 'd': if (convert_num(&main_url.ssl_log_level, argv))
+			case 'd': if (convert_num(&main_url.log_level, argv))
 					  return 4;
 				  shift;
 				  break;
-#endif
 #ifdef RETRY_ON_RESET
 			case 'r': if (convert_num(&main_url.retry_reset, argv))
 					  return 4;
@@ -1125,19 +1269,20 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Connection failed.\n");
 		return 3;
 	}
-#ifdef USE_SSL
 	else {
 		print_ssl_info(main_url.ss);
 	}
-#endif
 	close_client_socket(&main_url);
 	struct stat st;
 	off_t size = get_stat(&main_url, &st);
 	if (size >= 0) {
-		fprintf(stderr, "file size: \t%" PRIdMAX "\n", (intmax_t)size);
+		trace("file size: \t%" PRIdMAX "\n", (intmax_t)size);
 	} else {
 		return 3;
 	}
+
+	pthread_mutex_init(&tab_mutex, NULL);
+	hcreate_r(BUCKET_MAX, &tab);
 
 	shift;
 	if (fork_terminal && access(fork_terminal, O_RDWR)) {
@@ -1145,10 +1290,9 @@ int main(int argc, char *argv[])
 		fork_terminal=0;
 	}
 
-#ifdef USE_THREAD
 	close_client_force(&main_url); /* each thread should open its own socket */
 	pthread_key_create(&url_key, &destroy_url_copy);
-#endif
+
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 	struct fuse_chan *ch;
 	char *mountpoint;
@@ -1206,7 +1350,6 @@ int main(int argc, char *argv[])
 	return err ? err : 0;
 }
 
-#ifdef USE_SSL
 /* handle non-fatal SSL errors */
 int handle_ssl_error(struct_url *url, ssize_t * res, const char *where)
 {
@@ -1221,7 +1364,7 @@ int handle_ssl_error(struct_url *url, ssize_t * res, const char *where)
 		return 0;
 
 	if (*res == GNUTLS_E_REHANDSHAKE) {
-		fprintf(stderr, "%s: %s: %s: %zd %s.\n", argv0, url->tname, where, *res,
+		trace("SSL %s: %s: %zd %s.\n", url->tname, where, *res,
 		    "SSL rehanshake requested by server");
 		if (gnutls_safe_renegotiation_status(url->ss)) {
 			*res = gnutls_handshake (url->ss);
@@ -1230,7 +1373,7 @@ int handle_ssl_error(struct_url *url, ssize_t * res, const char *where)
 			}
 			return 1;
 		} else {
-			fprintf(stderr, "%s: %s: %s: %zd %s.\n", argv0, url->tname, where, *res,
+			fprintf(stderr, "SSL %s: %s: %zd %s.\n", url->tname, where, *res,
 			    "safe rehandshake not supported on this connection");
 			return 0;
 		}
@@ -1244,7 +1387,6 @@ int handle_ssl_error(struct_url *url, ssize_t * res, const char *where)
 
 	return 0;
 }
-#endif
 
 /*
  * Socket operations that abstract ssl and keepalive as much as possible.
@@ -1254,7 +1396,7 @@ int handle_ssl_error(struct_url *url, ssize_t * res, const char *where)
 
 static int close_client_socket(struct_url *url) {
 	if (url->sock_type == SOCK_KEEPALIVE) {
-		fprintf(stderr, "%s: %s: keeping socket open.\n", argv0, url->tname); /*DEBUG*/
+		trace("%s: keeping socket open.\n", url->tname);
 		return SOCK_KEEPALIVE;
 	}
 	return close_client_force(url);
@@ -1264,21 +1406,20 @@ static int close_client_force(struct_url *url) {
 	int sock_closed = 0;
 
 	if (url->sock_type != SOCK_CLOSED) {
-		fprintf(stderr, "%s: %s: closing socket.\n", argv0, url->tname); /*DEBUG*/
-#ifdef USE_SSL
+		trace("%s: closing socket.\n", url->tname);
 		if (url->proto == PROTO_HTTPS) {
-			fprintf(stderr, "%s: %s: closing SSL socket.\n", argv0, url->tname);
+			trace("%s: closing SSL socket.\n", url->tname);
 			gnutls_bye(url->ss, GNUTLS_SHUT_RDWR);
 			gnutls_deinit(url->ss);
 		}
-#endif
 		close(url->sockfd);
 		sock_closed = 1;
 	}
 	url->sock_type = SOCK_CLOSED;
 
 	if (url->redirected && url->redirect_followed) {
-		fprintf(stderr, "%s: %s: returning from redirect to master %s\n", argv0, url->tname, url->url);
+		trace("%s: returning from redirect to master %s\n",
+		    url->tname, url->url);
 		if (sock_closed) url->redirect_depth = 0;
 		url->redirect_followed = 0;
 		url->redirected = 0;
@@ -1289,51 +1430,13 @@ static int close_client_force(struct_url *url) {
 	return url->sock_type;
 }
 
-#ifdef USE_THREAD
-
 static void destroy_url_copy(void * urlptr)
 {
 	if (urlptr) {
-		fprintf(stderr, "%s: Thread %08lX ended.\n", argv0, pthread_self()); /*DEBUG*/
 		free_url(urlptr);
 		free(urlptr);
 	}
 }
-
-static struct_url * create_url_copy(const struct_url * url)
-{
-	struct_url * res = calloc(1, sizeof(struct_url));
-	memcpy(res, url, sizeof(struct_url));
-	if (url->name)
-		res->name = strdup(url->name);
-	if (url->host)
-		res->host = strdup(url->host);
-	if (url->path)
-		res->path = strdup(url->path);
-#ifdef USE_AUTH
-	if (url->auth)
-		res->auth = strdup(url->auth);
-#endif
-	memset(res->tname, 0, TNAME_LEN + 1);
-	snprintf(res->tname, TNAME_LEN, "%0*lX", TNAME_LEN, pthread_self());
-	return res;
-}
-
-static struct_url * thread_setup(void)
-{
-	struct_url * res = pthread_getspecific(url_key);
-	if (!res) {
-		fprintf(stderr, "%s: Thread %08lX started.\n", argv0, pthread_self()); /*DEBUG*/
-		res = create_url_copy(&main_url);
-		pthread_setspecific(url_key, res);
-	}
-	return res;
-}
-
-#else /*USE_THREAD*/
-static struct_url * thread_setup(void) { return &main_url; }
-#endif
-
 
 static ssize_t read_client_socket(struct_url *url, void * buf, size_t len) {
 	ssize_t res;
@@ -1341,15 +1444,12 @@ static ssize_t read_client_socket(struct_url *url, void * buf, size_t len) {
 	timeout.tv_sec = url->timeout;
 	timeout.tv_usec = 0;
 	setsockopt(url->sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-#ifdef USE_SSL
 	if (url->proto == PROTO_HTTPS) {
 		do {
 			res = gnutls_record_recv(url->ss, buf, len);
 		} while ((res < 0) && handle_ssl_error(url, &res, "read"));
 		if (res <= 0) ssl_error(res, url, "read");
-	} else
-#endif
-	{
+	} else {
 		res = read(url->sockfd, buf, len);
 		if (res <= 0) errno_report("read");
 	}
@@ -1364,17 +1464,15 @@ write_client_socket(struct_url *url, const void * buf, size_t len)
 		ssize_t res;
 
 		if (fd < 0) return -1; /*error hopefully reported by open*/
-#ifdef USE_SSL
 		if (url->proto == PROTO_HTTPS) {
 			do {
 				res = gnutls_record_send(url->ss, buf, len);
 			} while ((res < 0) && handle_ssl_error(url, &res, "write"));
 			if (res <= 0) ssl_error(res, url, "write");
-		} else
-#endif
-		{
+		} else {
 			res = write(url->sockfd, buf, len);
-			printf("wrote %ld bytes\n", len);
+			trace("wrote %ld bytes, sock_type keep-alive? %d\n", res,
+			    url->sock_type == SOCK_KEEPALIVE);
 			if (res <= 0) errno_report("write");
 		}
 		if (!(res <= 0) || (url->sock_type != SOCK_KEEPALIVE)) return res;
@@ -1419,7 +1517,7 @@ static int open_client_socket(struct_url *url) {
 	int sock_family, sock_type, sock_protocol;
 
 	if (url->sock_type == SOCK_KEEPALIVE) {
-		fprintf(stderr, "%s: %s: reusing keepalive socket.\n", argv0, url->tname); /*DEBUG*/
+		trace("%s: reusing keepalive socket.\n", url->tname);
 		return url->sock_type;
 	}
 
@@ -1428,7 +1526,7 @@ static int open_client_socket(struct_url *url) {
 	if (url->redirected)
 		url->redirect_followed = 1;
 
-	fprintf(stderr, "%s: %s: connecting to %s port %i.\n", argv0, url->tname, url->host, url->port);
+	trace("%s: connecting to %s port %i.\n", url->tname, url->host, url->port);
 
 	(void) memset((void*) &sa, 0, sizeof(sa));
 
@@ -1438,8 +1536,8 @@ static int open_client_socket(struct_url *url) {
 	hints.ai_socktype = SOCK_STREAM;
 	(void) snprintf(portstr, sizeof(portstr), "%d", (int) url->port);
 	if ((gaierr = getaddrinfo(url->host, portstr, &hints, &ai)) != 0) {
-		(void) fprintf(stderr, "%s: %s: getaddrinfo %s - %s\n",
-		    argv0, url->tname, url->host, gai_strerror(gaierr));
+		trace("%s: getaddrinfo %s - %s\n",
+		    url->tname, url->host, gai_strerror(gaierr));
 		errno = EIO;
 		return -1;
 	}
@@ -1456,14 +1554,14 @@ static int open_client_socket(struct_url *url) {
 	if (aiv4 == NULL)
 		aiv4 = aiv6;
 	if (aiv4 == NULL) {
-		(void) fprintf(stderr, "%s: %s: no valid address found for host %s\n",
-		    argv0, url->tname, url->host);
+		(void) fprintf(stderr, "%s: no valid address found for host %s\n",
+		    url->tname, url->host);
 		errno = EIO;
 		return -1;
 	}
 	if (sizeof(sa) < aiv4->ai_addrlen) {
-		(void) fprintf(stderr, "%s: %s: %s - sockaddr too small (%lu < %lu)\n",
-		    argv0, url->tname, url->host, (unsigned long) sizeof(sa),
+		(void) fprintf(stderr, "%s: %s - sockaddr too small (%lu < %lu)\n",
+		    url->tname, url->host, (unsigned long) sizeof(sa),
 		    (unsigned long) aiv4->ai_addrlen);
 		errno = EIO;
 		return -1;
@@ -1479,7 +1577,7 @@ static int open_client_socket(struct_url *url) {
 
 	he = gethostbyname(url->host);
 	if (he == NULL) {
-		(void) fprintf(stderr, "%s: %s: unknown host - %s\n", argv0, url->tname, url->host);
+		(void) fprintf(stderr, "%s: unknown host - %s\n", url->tname, url->host);
 		errno = EIO;
 		return -1;
 	}
@@ -1504,7 +1602,6 @@ static int open_client_socket(struct_url *url) {
 		return -1;
 	}
 
-#ifdef USE_SSL
 	if ((url->proto) == PROTO_HTTPS) {
 		/* Make SSL connection. */
 		ssize_t r = 0;
@@ -1518,7 +1615,7 @@ static int open_client_socket(struct_url *url) {
 				if (!r)
 					r = gnutls_certificate_set_x509_trust_file (url->sc, url->cafile, GNUTLS_X509_FMT_PEM);
 				if (r>0)
-					fprintf(stderr, "%s: SSL init: loaded %zi CA certificate(s).\n", argv0, r);
+					trace("SSL init: loaded %zi CA certificate(s).\n", r);
 				if (r>0) r = 0;
 			}
 			if (!r)
@@ -1526,7 +1623,7 @@ static int open_client_socket(struct_url *url) {
 			gnutls_certificate_set_verify_flags (url->sc, GNUTLS_VERIFY_ALLOW_X509_V1_CA_CRT /* suggested */
 			    | url->md5 | url->md2); /* oprional for old cert compat */
 			if (!r) url->ssl_initialized = 1;
-			gnutls_global_set_log_level((int)url->ssl_log_level);
+			gnutls_global_set_log_level((int)url->log_level);
 			gnutls_global_set_log_function(&logfunc);
 		}
 		if (r) {
@@ -1534,7 +1631,7 @@ static int open_client_socket(struct_url *url) {
 			return -1;
 		}
 
-		fprintf(stderr, "%s: %s: initializing SSL socket.\n", argv0, url->tname);
+		trace("%s: initializing SSL socket.\n", url->tname);
 		r = gnutls_init(&url->ss, GNUTLS_CLIENT);
 		if (!r) gnutls_session_set_ptr(url->ss, url); /* used in cert verifier */
 		if (!r) r = gnutls_priority_set_direct(url->ss, ps, &errp);
@@ -1546,29 +1643,17 @@ static int open_client_socket(struct_url *url) {
 		do ; while ((r) && handle_ssl_error(url, &r, "opening SSL socket"));
 		if (r) {
 			close(url->sockfd);
-			if (errp) fprintf(stderr, "%s: invalid SSL priority\n %s\n %*s\n", argv0, ps, (int)(errp - ps), "^");
-			fprintf(stderr, "%s: %s:%d - ", argv0, url->host, url->port);
+			if (errp) fprintf(stderr, "invalid SSL priority\n %s\n %*s\n", ps, (int)(errp - ps), "^");
+			fprintf(stderr, "%s:%d - ", url->host, url->port);
 			ssl_error(r, url, "SSL connection failed");
-			fprintf(stderr, "%s: %s: closing SSL socket.\n", argv0, url->tname);
+			trace("%s: closing SSL socket.\n", url->tname);
 			gnutls_deinit(url->ss);
 			errno = EIO;
 			return -1;
 		}
 		url->ssl_connected = 1; /* Prevent printing cert data over and over again */
 	}
-#endif
 	return url->sock_type = SOCK_OPEN;
-}
-
-static void
-http_report(const char *reason, const char *method,
-    const char *buf, size_t len)
-{
-	struct_url * url = thread_setup();
-
-	fprintf(stderr, "%s: %s: %s: %s\n", argv0, url->tname, method, reason);
-	fwrite(buf, len, 1, stderr);
-	if (len && ( *(buf+len-1) != '\n')) fputc('\n', stderr);
 }
 
 /*
@@ -1597,6 +1682,13 @@ parse_header(struct_url *url, const char *buf, size_t bytes,
 	}
 
 	int is_post = strcmp(method, "POST") == 0;
+	int is_del = strcmp(method, "DELETE") == 0;
+	int is_main_url = *url->name == 0;
+
+	if (is_del) {
+		seen_accept = 1;
+		seen_length = 1;
+	}
 
 	end = memchr(ptr, '\n', bytes);
 	if (!end) {
@@ -1616,6 +1708,8 @@ parse_header(struct_url *url, const char *buf, size_t bytes,
 		if (mempref(end, "\n\r\n", bytes - (size_t)(end - ptr), 1)) break;
 	}
 	ssize_t header_len = (end + 3) - ptr;
+
+	trace("=== REPL ===\n %.*s", (int)header_len, ptr);
 
 	end = memchr(ptr, '\n', bytes);
 	char *http = "HTTP/1.1 ";
@@ -1651,17 +1745,18 @@ parse_header(struct_url *url, const char *buf, size_t bytes,
 
 				url->redirect_depth ++;
 				if (url->redirect_depth > MAX_REDIRECTS) {
-					fprintf(stderr, "%s: %s: server redirected %i times already. Giving up.", argv0, url->tname, MAX_REDIRECTS);
+					fprintf(stderr, "%s: server redirected %i times already. Giving up.",
+					    url->tname, MAX_REDIRECTS);
 					errno = EIO;
 					return -1;
 				}
 
 				if (status == 301) {
-					fprintf(stderr, "%s: %s: permanent redirect to %s\n", argv0, url->tname, tmp);
+					trace("%s: permanent redirect to %s\n", url->tname, tmp);
 
 					res = parse_url(tmp, url, URL_SAVE);
 				} else {
-					fprintf(stderr, "%s: %s: temporary redirect to %s\n", argv0, url->tname, tmp);
+					trace("%s: temporary redirect to %s\n", url->tname, tmp);
 
 					url->redirected = 1;
 					res = parse_url(tmp, url, URL_DROP);
@@ -1686,13 +1781,15 @@ parse_header(struct_url *url, const char *buf, size_t bytes,
 			url->sid = NULL;
 			return -EAGAIN;
 		}
-		fprintf(stderr, "%s: %s: failed with status: %d%.*s. Expected: %d\n",
-		    argv0, method, status, (int)((end - ptr) - 1), ptr, expect);
-		if (!strcmp("HEAD", method)) fwrite(buf, bytes, 1, stderr); /*DEBUG*/
 		if (status == 404)
 			errno = ENOENT;
-		else
+		else {
+			fprintf(stderr, "%s: failed with status: %d%.*s. Expected: %d\n",
+			    method, status, (int)((end - ptr) - 1), ptr, expect);
+			if (main_url.log_level)
+				fprintf(stderr, buf, bytes);
 			errno = EIO;
+		}
 		return -1;
 	}
 
@@ -1703,10 +1800,9 @@ parse_header(struct_url *url, const char *buf, size_t bytes,
 
 	char *content_length_str = "Content-Length: ";
 	char *accept = "Accept-Ranges: bytes";
-	char *range = "Content-Range: bytes";
 	char *date = "Last-Modified: ";
 	char *close = "Connection: close";
-	char *sid_str = "session-id: ";
+	char *sid_str = "x-session-id: ";
 	struct tm tm;
 	while(1)
 	{
@@ -1744,16 +1840,12 @@ parse_header(struct_url *url, const char *buf, size_t bytes,
 			seen_length = 1;
 			continue;
 		}
-		if (mempref(ptr, sid_str, (size_t)(end - ptr), 0)) {
+		if (!is_main_url && mempref(ptr, sid_str, (size_t)(end - ptr), 0)) {
 			if (url->sid)
 				free(url->sid);
 			url->sid = strndup(ptr + strlen(sid_str), (size_t)(end - (ptr + strlen(sid_str)) + 1));
-			url->sid[end - (ptr + strlen(sid_str))] = 0;
-			continue;
-		}
-		if (mempref(ptr, range, (size_t)(end - ptr), 0)) {
-			seen_accept = 1;
-			continue;
+			url->sid[end - (ptr + strlen(sid_str)) - 1] = 0;
+                       continue;
 		}
 		if (mempref(ptr, accept, (size_t)(end - ptr), 0)) {
 			seen_accept = 1;
@@ -1788,31 +1880,53 @@ parse_header(struct_url *url, const char *buf, size_t bytes,
 static ssize_t
 exchange(struct_url *url, char *buf, const char *method,
     off_t * content_length, off_t start, off_t end, size_t * header_length,
-    const char *data)
+    const char *data, char *comp)
 {
 	ssize_t res;
 	size_t bytes;
 	int range = (end > 0);
-	int is_post = !strcmp(method, "POST");
-	int is_finalize = is_post && !range;
+	int is_post = strcmp(method, "POST") == 0;
+	int is_del = strcmp(method, "DELETE") == 0;
+	int is_head = strcmp(method, "HEAD") == 0;
+	int is_finalize = !range;
 	intmax_t len = range ? ((intmax_t)end - (intmax_t)start + 1) : 0;
+	char fullpath[2048];
 
+	if (*url->name)
+		sprintf(fullpath, "%s/%s", url->path, url->name);
+	else {
+		sprintf(fullpath, "%s", url->path);
+		is_finalize = 1; /* bucket op - always finalize */
+	}
 req:
 	/* Build request buffer, starting with the request method. */
 
-	bytes = (size_t)snprintf(buf, HEADER_SIZE, "%s %s?comp=streamsession%s HTTP/1.1\r\nHost: %s\r\n",
-	    method, url->path, (is_finalize ? "&finalize" : ""), url->host);
+	bytes = (size_t)snprintf(buf, HEADER_SIZE, "%s %s?comp=%s%s HTTP/1.1\r\nHost: %s:%d\r\n",
+	    method, fullpath, comp, (is_finalize ? "&finalize" : ""), url->host, url->port);
 	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 	    "User-Agent: %s %s\r\n", __FILE__, VERSION);
 	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 	    "x-ccow-offset: %" PRIdMAX "\r\nx-ccow-length: %" PRIdMAX "\r\n",
 	    (intmax_t)start, len);
-	if (url->sid)
+	if (strcmp(comp, "kv") == 0)
 		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
-		    "session-id: %s\r\n", url->sid);
-	if (is_post && range)
+		    "Content-Type: text/csv\r\n");
+	else if (url->sid)
+//		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
+//		    "x-session-id: %.*s\r\n", (int)strlen(url->sid)-1, url->sid);
+		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
+		    "x-session-id: %s\r\n", url->sid);
+	else if (is_finalize && data) // CREATE
+		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
+		    "x-ccow-object-oflags: 3\r\n");
+	if (is_post) {
+		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
+		    "Content-Type: application/octet-stream\r\n");
 		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 		    "Content-Length: %" PRIdMAX "\r\n", len);
+	}
+	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
+	    "Connection: keep-alive\r\n");
 #ifdef USE_AUTH
 	if (url->auth)
 		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
@@ -1820,7 +1934,7 @@ req:
 #endif
 	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes, "\r\n");
 
-printf("======= HTTP HDR ======\r\n%s", buf);
+	trace("=== HTTP HDR ctx=%p ===\r\n%s", url, buf);
 
 	/* Now actually send it. */
 	while (1) {
@@ -1852,13 +1966,13 @@ printf("======= HTTP HDR ======\r\n%s", buf);
 		url->resets = 0;
 #endif
 		if (CONNFAIL) {
-			errno_report("exchange: failed to send request, retrying"); /* DEBUG */
+			errno_report("exchange: failed to send request, retrying");
 			if (close_client_force(url) == -EAGAIN)
 				goto req;
 			continue;
 		}
 		if (res <= 0) {
-			errno_report("exchange: failed to send request"); /* DEBUG */
+			errno_report("exchange: failed to send request");
 			if (close_client_force(url) == -EAGAIN)
 				goto req;
 			if (!errno)
@@ -1866,13 +1980,19 @@ printf("======= HTTP HDR ======\r\n%s", buf);
 			return res;
 		}
 
-		if (is_finalize)
+		if (is_finalize) {
+			if (url->sid)
+				free(url->sid);
 			url->sid = NULL;
+		}
 
-		if (is_post && range)
+		if (is_post && range) {
 			res = write_client_socket(url, data, (size_t)len);
+		}
 
-		res = read_client_socket(url, buf, HEADER_SIZE);
+		if (res > 0) {
+			res = read_client_socket(url, buf, HEADER_SIZE);
+		}
 
 #ifdef RETRY_ON_RESET
 		if ((errno == ECONNRESET) && (url->resets < url->retry_reset)) {
@@ -1886,12 +2006,13 @@ printf("======= HTTP HDR ======\r\n%s", buf);
 		url->resets = 0;
 #endif
 		if (CONNFAIL) {
-			errno_report("exchange: did not receive a reply, retrying"); /* DEBUG */
+			errno_report("exchange: did not receive a reply, retrying");
+			sleep(1);
 			if (close_client_force(url) == -EAGAIN)
 				goto req;
 			continue;
 		} else if (res <= 0) {
-			errno_report("exchange: failed receving reply from server"); /* DEBUG */
+			errno_report("exchange: failed receving reply from server");
 			if (close_client_force(url) == -EAGAIN)
 				goto req;
 			if (!errno)
@@ -1901,12 +2022,14 @@ printf("======= HTTP HDR ======\r\n%s", buf);
 			bytes = (size_t)res;
 
 			res = parse_header(url, buf, bytes, method, content_length,
-			    (range && !is_post) ? 206 : 200);
+			    (range && !is_post) ? 206 :
+			    (is_del) ? 204 : 200);
 			if (res == -EAGAIN) /* redirect */
 				goto req;
 
 			if (res <= 0) {
-				http_report("exchange: server error", method, buf, bytes);
+				if (!is_head || errno != ENOENT)
+					http_report("exchange: server error", method, buf, bytes);
 				return res;
 			}
 
@@ -1925,8 +2048,8 @@ printf("======= HTTP HDR ======\r\n%s", buf);
 static off_t get_stat(struct_url *url, struct stat * stbuf) {
 	char buf[HEADER_SIZE];
 
-	printf("get_stat\n");
-	if (exchange(url, buf, "HEAD", &(url->file_size), 0, 0, 0, NULL) < 0)
+	trace("name=%s sid=%s\n", url->name, url->sid);
+	if (exchange(url, buf, "HEAD", &(url->file_size), 0, 0, 0, NULL, "streamsession") < 0)
 		return -1;
 
 	close_client_socket(url);
@@ -1952,10 +2075,10 @@ static ssize_t get_data(struct_url *url, off_t start, size_t size)
 	size_t header_length;
 
 	bytes = exchange(url, buf, "GET", &content_length,
-	    start, end, &header_length, NULL);
+	    start, end, &header_length, NULL, "streamsession");
 	if (bytes <= 0) return -1;
 
-	printf("get_data %ld %ld sid=%s\n", content_length, size, url->sid);
+	trace("content_length %ld size %ld sid=%s\n", content_length, size, url->sid);
 	if (content_length != size) {
 		http_report("didn't yield the whole piece.", "GET", 0, 0);
 		size = min((size_t)content_length, size);
@@ -2000,17 +2123,118 @@ static ssize_t post_data(struct_url *url, const char *data, off_t start,
 	size_t header_length;
 	ssize_t res = 0;
 
+	trace("sid=%s\n", url->sid);
 	if (size)
 		end = start + (off_t)size - 1;
-	else if (!url->sid)
-		return 0;
+//	else if (!url->sid)
+//		return 0;
 
+	pthread_mutex_lock(&tab_mutex);
 	res = exchange(url, buf, "POST", &content_length,
-	    start, end, &header_length, data);
-	if (res < 0)
+	    start, end, &header_length, data, "streamsession");
+	pthread_mutex_unlock(&tab_mutex);
+	if (res <= 0)
 		return -1;
 
 	close_client_socket(url);
 
-	return res;
+	return (ssize_t)size;
+}
+
+/*
+ * del_data does all the magic
+ * a DELETE-Request
+ * allows to delete an object
+ */
+
+static int del_data(struct_url *url)
+{
+	char buf[HEADER_SIZE];
+	off_t content_length;
+
+	trace("sid=%s\n", url->sid);
+
+	if (exchange(url, buf, "DELETE", &content_length, 0, 0, 0, NULL, "streamsession") < 0)
+		return -1;
+
+	close_client_socket(url);
+
+	return 0;
+}
+
+/*
+ * list_data does all the magic
+ * a GET-Request with offset to populte directory
+ */
+
+static ssize_t list_data(struct_url *url, off_t off, size_t size,
+    fuse_req_t req, struct dirbuf *db)
+{
+	char buf[HEADER_SIZE];
+	ssize_t bytes;
+	off_t end = off + (off_t)size - 1;
+	off_t content_length;
+	size_t header_length;
+	char *destination = url->req_buf;
+	const char *b;
+
+	bytes = exchange(url, buf, "GET", &content_length,
+	    off, end, &header_length, NULL, "kv");
+	if (bytes <= 0) return -1;
+
+	trace("hdr_len=%ld content_len=%ld off=%ld size=%ld bytes=%ld\n",
+	    header_length, content_length, off, size, bytes);
+	if (content_length != size) {
+		size = min((size_t)content_length, size);
+	}
+
+	b = buf + header_length;
+
+	bytes -= (b - buf);
+	memcpy(destination, b, (size_t)bytes);
+	size -= (size_t)bytes;
+	destination +=bytes;
+	for (; size > 0; size -= (size_t)bytes, destination += bytes) {
+
+		bytes = read_client_socket(url, destination, size);
+		trace("read extra %ld bytes\n", bytes);
+		if (bytes < 0) {
+			errno_report("GET (read)");
+			return -1;
+		}
+		if (bytes == 0) {
+			break;
+		}
+	}
+
+	close_client_socket(url);
+
+	bytes = content_length;
+
+	size_t thisoff, nextoff=0, lenentry;
+	char *saveptr;
+	char *line = strtok_r(url->req_buf, "\n", &saveptr);
+	while (line && (line - url->req_buf) < content_length) {
+
+		/* From the fuse_dirent_size function in
+		 * fuse-2.9.3/lib/fuse_lowlevel.c and the header file
+		 * fuse-2.9.3/include/fuse_kernel.h. It is the offset of
+		 * the name parameter from the start of the fuse_dirent
+		 * structure, plus the length of the filename,
+		 * all rounded to a multiple of sizeof(__u64). */
+		lenentry = ((24+strlen(line)+7)&~7UL);
+
+		thisoff = nextoff; /* offset of this entry */
+		nextoff += lenentry;
+
+		/* Skip this entry if we weren't asked for it */
+		if (thisoff >= off) {
+			/* Add this to our response until we are asked to stop */
+			fuse_ino_t ino = newino(line);
+			dirbuf_add(req, db, line, ino);
+		}
+		line  = strtok_r(NULL, "\n", &saveptr);
+	}
+
+	return (ssize_t)(end - off) + 1 - (ssize_t)size;
 }

@@ -1,6 +1,12 @@
-MAIN_CFLAGS :=  -g -Os -Wall $(shell pkg-config fuse --cflags)
-MAIN_CPPFLAGS := -Wall -Wno-unused-function -Wconversion -Wtype-limits -DUSE_AUTH -D_XOPEN_SOURCE=700 -D_ISOC99_SOURCE
-THR_CPPFLAGS := -DUSE_THREAD
+#
+# Activate by exporing this env variable:
+#
+# export ASAN_OPTIONS=symbolize=1:abort_on_error=1:disable_core=1:alloc_dealloc_mismatch=0:detect_leaks=1
+#
+ASAN_CPPFLAGS=-fsanitize=address -fno-omit-frame-pointer -fno-common
+ASAN_LDFLAGS=-fsanitize=address -fno-omit-frame-pointer -fno-common -lasan
+MAIN_CFLAGS :=  -g -Os -Wall $(shell pkg-config fuse --cflags) $(ASAN_CPPFLAGS)
+MAIN_CPPFLAGS := -Wall -Wno-unused-function -Wconversion -Wtype-limits -DUSE_AUTH -D_XOPEN_SOURCE=700 -D_ISOC99_SOURCE $(ASAN_LDFLAGS)
 THR_LDFLAGS := -lpthread
 GNUTLS_VERSION := 2.10
 MAIN_LDFLAGS := $(shell pkg-config fuse --libs | sed -e s/-lrt// -e s/-ldl// -e s/-pthread// -e "s/  / /g")
@@ -27,7 +33,7 @@ targets = $(binaries) $(manpages)
 all: $(targets)
 
 edgefs: edgefs.c
-	$(CC) $(MAIN_CPPFLAGS) $(CPPFLAGS) $(MAIN_CFLAGS) $(CFLAGS) edgefs.c $(MAIN_LDFLAGS) $(LDFLAGS) -o $@
+	$(CC) $(MAIN_CPPFLAGS) $(CPPFLAGS) $(MAIN_CFLAGS) $(CFLAGS) edgefs.c $(MAIN_LDFLAGS) $(THR_LDFLAGS) $(LDFLAGS) -o $@
 
 edgefs%.1: edgefs.1
 	ln -sf edgefs.1 $@
