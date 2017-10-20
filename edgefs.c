@@ -111,6 +111,7 @@ typedef struct url {
 #endif
 	int sockfd;
 	enum sock_state sock_type;
+	int truncate;
 	int redirected;
 	int redirect_followed;
 	int redirect_depth;
@@ -436,15 +437,15 @@ static int reply_buf_limited(fuse_req_t req, const char *buf, size_t bufsize,
 		return fuse_reply_buf(req, NULL, 0);
 }
 
-static void edgefs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
+static void edgefs_readdir(fuse_req_t req, fuse_ino_t dir_ino, size_t size,
     off_t off, struct fuse_file_info *fi)
 {
 	(void) fi;
 	struct dirbuf b;
 	ssize_t res;
 
-	trace("readdir ino=%lx\n", ino);
-	if (ino != 1) {
+	trace("readdir ino=%lx\n", dir_ino);
+	if (dir_ino != 1) {
 		fuse_reply_err(req, ENOTDIR);
 		return;
 	}
@@ -475,6 +476,7 @@ static void edgefs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 
 	reply_buf_limited(req, b.p, b.size, off, size);
 	free(b.p);
+	destroy_url_copy(url);
 }
 
 static void edgefs_open(fuse_req_t req, fuse_ino_t ino,
@@ -493,6 +495,8 @@ static void edgefs_open(fuse_req_t req, fuse_ino_t ino,
 		}
 		url->sock_type = SOCK_KEEPALIVE;
 		fi->fh = (uint64_t)url;
+		if (fi->flags & O_TRUNC)
+			url->truncate = 1;
 		fuse_reply_open(req, fi);
 	}
 }
@@ -566,7 +570,7 @@ static void edgefs_release(fuse_req_t req, fuse_ino_t ino,
 
 	res = post_data(url, NULL, 0, 0);
 	if (res < 0)
-		fuse_reply_err(req, EIO);
+		fuse_reply_err(req, errno);
 	else
 		fuse_reply_err(req, 0);
 	destroy_url_copy(url);
@@ -583,7 +587,7 @@ static void edgefs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
 
 	res = post_data(url, NULL, 0, 0);
 	if (res < 0)
-		fuse_reply_err(req, EIO);
+		fuse_reply_err(req, errno);
 	else
 		fuse_reply_err(req, 0);
 }
@@ -611,9 +615,10 @@ static void edgefs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 	url->sock_type = SOCK_KEEPALIVE;
 	fi->fh = (uint64_t)url;
 
-	res = post_data(url, "", 0, 0);
+	url->truncate = 1;
+	res = post_data(url, NULL, 0, 0);
 	if (res < 0) {
-		fuse_reply_err(req, EIO);
+		fuse_reply_err(req, errno);
 		return;
 	}
 	st.st_mode = S_IFREG | 0644;
@@ -661,7 +666,14 @@ static void edgefs_forget(fuse_req_t req, fuse_ino_t ino, unsigned long nlookup)
 	fuse_reply_none(req);
 }
 
+static void edgefs_init(void *userdata, struct fuse_conn_info *conn)
+{
+	conn->max_write = 131072;
+	conn->max_readahead = 131072;
+}
+
 static struct fuse_lowlevel_ops edgefs_oper = {
+	.init               = edgefs_init,
 	.lookup             = edgefs_lookup,
 	.getattr            = edgefs_getattr,
 	.setattr            = edgefs_setattr,
@@ -1290,6 +1302,7 @@ int main(int argc, char *argv[])
 
 	if (fuse_parse_cmdline(&args, &mountpoint, NULL, NULL) != -1 &&
 	    (ch = fuse_mount(mountpoint, &args)) != NULL) {
+
 		/* try to fork at some point where the setup is mostly done */
 		/* FIXME try to close std* and the like ? */
 		if (do_fork) fork_res = fork();
@@ -1902,13 +1915,13 @@ req:
 		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 		    "Content-Type: text/csv\r\n");
 	else if (url->sid)
-//		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
-//		    "x-session-id: %.*s\r\n", (int)strlen(url->sid)-1, url->sid);
 		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 		    "x-session-id: %s\r\n", url->sid);
-	else if (is_finalize && data) // CREATE
+	else if (url->truncate) { // CREATE or TRUNCATE (-o atomic_o_trunc)
 		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 		    "x-ccow-object-oflags: 3\r\n");
+		url->truncate = 0;
+	}
 	if (is_post) {
 		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 		    "Content-Type: application/octet-stream\r\n");
