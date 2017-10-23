@@ -870,12 +870,18 @@ verify_certificate_callback (gnutls_session_t session)
 		ssl_error(ret, url, "verify certificate");
 		return GNUTLS_E_CERTIFICATE_ERROR;
 	}
-	if (status & GNUTLS_CERT_INVALID)
-		trace("The server certificate is NOT trusted.\n");
+	if (status & GNUTLS_CERT_INVALID) {
+		if (!url->ssl_connected)
+			fprintf(stderr, "Warning: The server certificate is NOT trusted.\n");
+	}
 	if (status & GNUTLS_CERT_INSECURE_ALGORITHM)
 		trace("The server certificate uses an insecure algorithm.\n");
-	if (status & GNUTLS_CERT_SIGNER_NOT_FOUND)
-		trace("The server certificate hasn’t got a known issuer.\n");
+	if (status & GNUTLS_CERT_SIGNER_NOT_FOUND) {
+		if (!url->ssl_connected)
+			fprintf(stderr, "Warning: The server certificate hasn’t got a known issuer.\n");
+		status &= (unsigned int)~GNUTLS_CERT_SIGNER_NOT_FOUND;
+		status &= (unsigned int)~GNUTLS_CERT_INVALID;
+	}
 	if (status & GNUTLS_CERT_REVOKED)
 		trace("The server certificate has been revoked.\n");
 	if (status & GNUTLS_CERT_EXPIRED)
@@ -910,7 +916,7 @@ verify_certificate_callback (gnutls_session_t session)
 		trace("%s", data.data);
 		gnutls_free(data.data);
 	}
-	if (!hostname || !gnutls_x509_crt_check_hostname (cert, hostname))
+	if (!(url->ssl_connected) && (!hostname || !gnutls_x509_crt_check_hostname (cert, hostname)))
 	{
 		int found = 0;
 		if (hostname) {
@@ -943,9 +949,8 @@ verify_certificate_callback (gnutls_session_t session)
 			}
 		}
 		if (!found) {
-			trace("The server certificate’s owner does not match hostname ’%s’\n",
+			fprintf(stderr, "Warning: The server certificate’s owner does not match hostname ’%s’\n",
 			    hostname);
-			return GNUTLS_E_CERTIFICATE_ERROR;
 		}
 	}
 	gnutls_x509_crt_deinit (cert);
