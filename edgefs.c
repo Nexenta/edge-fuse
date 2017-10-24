@@ -109,6 +109,7 @@ typedef struct url {
 	long retry_reset; /*retry reset connections*/
 	long resets;
 #endif
+	int need_finalize;
 	int sockfd;
 	enum sock_state sock_type;
 	int truncate;
@@ -367,9 +368,14 @@ static int edgefs_stat(fuse_ino_t ino, struct fuse_file_info *fi,
 	stbuf->st_mode = S_IFREG | 0644;
 	stbuf->st_nlink = 1;
 
+	url->need_finalize = (fi == NULL);
+
 	res = (get_stat(url, stbuf) == -1) ? -1 : 0;
-	if (!fi)
+	if (!fi) {
+		if (res == 0)
+			INODE_TO_URL(ino)->file_size = url->file_size;
 		destroy_url_copy(url);
+	}
 	return res;
 }
 
@@ -510,7 +516,7 @@ static void edgefs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 	struct_url *url = (struct_url *)fi->fh;
 	ssize_t res;
 
-	if (url->file_size == off) {
+	if (url->file_size <= off) {
 		/* Handling of EOF is not well documented, returning EOF as error
 		 * does not work but this does.  */
 		fuse_reply_buf(req, NULL,  0);
@@ -541,22 +547,6 @@ static void edgefs_write(fuse_req_t req, fuse_ino_t ino,
 		fuse_reply_err(req, EIO);
 	else
 		fuse_reply_write(req, (size_t)res);
-}
-
-static void edgefs_flush(fuse_req_t req, fuse_ino_t ino,
-    struct fuse_file_info *fi)
-{
-	(void) fi;
-
-	trace("flush ino=%lx\n", ino);
-	struct_url *url = (struct_url *)fi->fh;
-	ssize_t res;
-
-	res = post_data(url, NULL, 0, 0);
-	if (res < 0)
-		fuse_reply_err(req, EIO);
-	else
-		fuse_reply_err(req, 0);
 }
 
 static void edgefs_release(fuse_req_t req, fuse_ino_t ino,
@@ -657,6 +647,7 @@ static void edgefs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 
 	struct_url *url = create_url_copy(INODE_TO_URL(ino), NULL);
 	del_data(url);
+	destroy_url_copy(url);
 	fuse_reply_err(req, 0);
 }
 
@@ -681,26 +672,12 @@ static struct fuse_lowlevel_ops edgefs_oper = {
 	.open               = edgefs_open,
 	.read               = edgefs_read,
 	.write              = edgefs_write,
-//	.flush              = edgefs_flush,
 	.release            = edgefs_release,
 	.forget             = edgefs_forget,
 	.fsync              = edgefs_fsync,
 	.create             = edgefs_create,
 	.unlink             = edgefs_unlink,
 };
-
-/*
- * A few utility functions
- */
-#ifdef NEED_STRNDUP
-static char *strndup(const char *str, size_t n) {
-	if (n > strlen(str)) n = strlen(str);
-	char *res = malloc(n + 1);
-	memcpy(res, str, n);
-	res[n] = 0;
-	return res;
-}
-#endif
 
 static int mempref(const char *mem, const char *pref, size_t size, int case_sensitive)
 {
@@ -1025,6 +1002,8 @@ static int free_url(struct_url* url)
 	url->path = 0;
 	if (url->name) free(url->name);
 	url->name = 0;
+	if (url->sid) free(url->sid);
+	url->sid = 0;
 #ifdef USE_AUTH
 	if (url->auth) free(url->auth);
 	url->auth = 0;
@@ -1306,6 +1285,8 @@ int main(int argc, char *argv[])
 	int fork_res = 0;
 
 	if (fuse_parse_cmdline(&args, &mountpoint, NULL, NULL) != -1 &&
+	    !fuse_opt_add_arg(&args, "-obig_writes") &&
+	    !fuse_opt_add_arg(&args, "-oatomic_o_trunc") &&
 	    (ch = fuse_mount(mountpoint, &args)) != NULL) {
 
 		/* try to fork at some point where the setup is mostly done */
@@ -1691,6 +1672,7 @@ parse_header(struct_url *url, const char *buf, size_t bytes,
 
 	int is_post = strcmp(method, "POST") == 0;
 	int is_del = strcmp(method, "DELETE") == 0;
+	int is_head = strcmp(method, "HEAD") == 0;
 	int is_main_url = *url->name == 0;
 
 	if (is_del) {
@@ -1806,6 +1788,7 @@ parse_header(struct_url *url, const char *buf, size_t bytes,
 		*content_length = 0;
 	}
 
+	char *logical_size_str = "x-ccow-logical-size: ";
 	char *content_length_str = "Content-Length: ";
 	char *accept = "Accept-Ranges: bytes";
 	char *date = "Last-Modified: ";
@@ -1842,11 +1825,22 @@ parse_header(struct_url *url, const char *buf, size_t bytes,
 
 		}
 		end = memchr(ptr, '\n', bytes - (size_t)(ptr - buf));
-		if (mempref(ptr, content_length_str, (size_t)(end - ptr), 0)
-		    && isdigit( *(ptr + strlen(content_length_str)))) {
-			*content_length = atoll(ptr + strlen(content_length_str));
-			seen_length = 1;
-			continue;
+		if (!is_main_url && is_head) {
+			/* HEAD case, expect x-ccow-logical-size */
+			if (mempref(ptr, logical_size_str, (size_t)(end - ptr), 0)
+			    && isdigit( *(ptr + strlen(logical_size_str)))) {
+				*content_length = atoll(ptr + strlen(logical_size_str));
+				seen_length = 1;
+				continue;
+			}
+		} else {
+			/* GET case or bucket HEAD case, expect Content-Length */
+			if (mempref(ptr, content_length_str, (size_t)(end - ptr), 0)
+			    && isdigit( *(ptr + strlen(content_length_str)))) {
+				*content_length = atoll(ptr + strlen(content_length_str));
+				seen_length = 1;
+				continue;
+			}
 		}
 		if (!is_main_url && mempref(ptr, sid_str, (size_t)(end - ptr), 0)) {
 			if (url->sid)
@@ -1896,7 +1890,7 @@ exchange(struct_url *url, char *buf, const char *method,
 	int is_post = strcmp(method, "POST") == 0;
 	int is_del = strcmp(method, "DELETE") == 0;
 	int is_head = strcmp(method, "HEAD") == 0;
-	int is_finalize = !range;
+	int is_finalize = !range && (!is_head || url->need_finalize);
 	intmax_t len = range ? ((intmax_t)end - (intmax_t)start + 1) : 0;
 	char fullpath[2048];
 
@@ -2094,10 +2088,12 @@ static ssize_t get_data(struct_url *url, off_t start, size_t size, char *destina
 		return -1;
 	}
 
-	trace("content_length %ld size %ld sid=%s\n", content_length, size, url->sid);
+	trace("content_length %ld bytes %ld size %ld sid=%s\n", content_length,
+	    bytes, size, url->sid);
 	if (content_length != size) {
-		http_report("didn't yield the whole piece.", "GET", 0, 0);
 		size = min((size_t)content_length, size);
+		end = start + (off_t)size - 1;
+		trace("didn't yield the whole piece, new size %ld end %ld\n", size, end);
 	}
 
 
