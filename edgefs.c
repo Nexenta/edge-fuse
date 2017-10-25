@@ -115,6 +115,7 @@ typedef struct url {
 	long chunk_size;
 	long btree_order;
 	int need_finalize;
+	_Bool direct_io;
 	int sockfd;
 	enum sock_state sock_type;
 	int truncate;
@@ -831,6 +832,7 @@ static void edgefs_open(fuse_req_t req, fuse_ino_t ino,
 			return;
 		}
 		url->sock_type = SOCK_KEEPALIVE;
+		fi->direct_io = url->direct_io;
 		fi->fh = (uint64_t)url;
 		if (fi->flags & O_TRUNC)
 			url->truncate = 1;
@@ -939,6 +941,7 @@ static void edgefs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 	}
 	url->sock_type = SOCK_KEEPALIVE;
 	fi->fh = (uint64_t)url;
+	fi->direct_io = url->direct_io;
 
 	url->need_finalize = 1;
 	url->truncate = 1;
@@ -1518,6 +1521,7 @@ static void usage(void)
 	fprintf(stderr, "\t -a \tCA file used to verify server certificate\n\t\t(default: %s)\n", CERT_STORE);
 	fprintf(stderr, "\t -c \tuse console for standard input/output/error\n\t\t(default: %s)\n", CONSOLE);
 	fprintf(stderr, "\t -d \tdebug level (default 0)\n");
+	fprintf(stderr, "\t -D \tenable direct_io mode\n");
 	fprintf(stderr, "\t -f \tstay in foreground - do not fork\n");
 	fprintf(stderr, "\t -b \tCCOW chunk size in bytes (default 131072, power of 2)\n");
 	fprintf(stderr, "\t -o \tCCOW btree order (default 256)\n");
@@ -1575,6 +1579,8 @@ int main(int argc, char *argv[])
 				  break;
 			case 'a': main_url.cafile = argv[1];
 				  shift;
+				  break;
+			case 'D': main_url.direct_io = 1;
 				  break;
 			case 'd': if (convert_num(&main_url.log_level, argv))
 					  return 4;
