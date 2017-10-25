@@ -65,14 +65,6 @@
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
 
-/*
- * ECONNRESET happens with some dodgy servers so may need to handle that.
- * Allow for building without ECONNRESET in case it is not defined.
- */
-#ifdef ECONNRESET
-#define RETRY_ON_RESET
-#endif
-
 #define CHUNK_SIZE 131072
 #define BTREE_ORDER 256
 #define TIMEOUT 30
@@ -105,15 +97,13 @@ typedef struct url {
 	int port;
 	char *path; /*get path*/
 	char *name; /*file name*/
-#ifdef USE_AUTH
 	char *auth; /*encoded auth data*/
-#endif
-#ifdef RETRY_ON_RESET
 	long retry_reset; /*retry reset connections*/
 	long resets;
-#endif
 	long chunk_size;
 	long btree_order;
+	long rcv_buf_size;
+	long snd_buf_size;
 	int need_finalize;
 	_Bool direct_io;
 	int sockfd;
@@ -205,8 +195,6 @@ trace_a(const char *fmt, ...)
 	} \
 } while (0)
 
-#ifdef USE_AUTH
-
 static char b64_encode_table[64] = {
 	'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',  /* 0-7 */
 	'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',  /* 8-15 */
@@ -267,8 +255,6 @@ static char *b64_encode(unsigned const char* ptr, long len) {
 	}
 	return space;
 }
-
-#endif /* USE_AUTH */
 
 /* public domain sha256 implementation based on fips180-3 */
 struct sha256 {
@@ -652,10 +638,8 @@ static struct_url * create_url_copy(const struct_url * url, char *newname)
 		res->path = strdup(url->path);
 	if (url->sid && newname && strcmp(newname, url->name) == 0)
 		res->sid = strdup(url->sid);
-#ifdef USE_AUTH
 	if (url->auth)
 		res->auth = strdup(url->auth);
-#endif
 	memset(res->tname, 0, TNAME_LEN + 1);
 	snprintf(res->tname, TNAME_LEN, "%0*lX", TNAME_LEN, pthread_self());
 	pthread_mutex_init((pthread_mutex_t *)&url->sid_mutex, NULL);
@@ -1342,9 +1326,7 @@ static int init_url(struct_url* url)
 	url->timeout = TIMEOUT;
 	url->chunk_size = CHUNK_SIZE;
 	url->btree_order = BTREE_ORDER;
-#ifdef RETRY_ON_RESET
 	url->retry_reset = RESET_RETRIES;
-#endif
 	url->cafile = CERT_STORE;
 	return 0;
 }
@@ -1364,10 +1346,8 @@ static int free_url(struct_url* url)
 	if (url->req_buf) free(url->req_buf);
 	url->req_buf = 0;
 	url->req_buf_size = 0;
-#ifdef USE_AUTH
 	if (url->auth) free(url->auth);
 	url->auth = 0;
-#endif
 	pthread_mutex_destroy(&url->sid_mutex);
 	url->port = 0;
 	url->proto = 0; /* only after socket closed */
@@ -1391,9 +1371,13 @@ static void print_url(FILE *f, const struct_url * url)
 	fprintf(f, "port number: \t%d\n", url->port);
 	fprintf(f, "protocol: \t%s\n", protocol);
 	fprintf(f, "request path: \t%s\n", url->path);
-#ifdef USE_AUTH
 	fprintf(f, "auth data: \t%s\n", url->auth ? "(present)" : "(null)");
-#endif
+
+	unsigned rcvBufferSize, sndBufferSize;
+	unsigned sockOptSize = sizeof(rcvBufferSize);
+	getsockopt(url->sockfd, SOL_SOCKET, SO_RCVBUF, &rcvBufferSize, &sockOptSize);
+	getsockopt(url->sockfd, SOL_SOCKET, SO_SNDBUF, &sndBufferSize, &sockOptSize);
+	fprintf(f, "sk buf rcv/snd: %d/%d KB\n", rcvBufferSize/1024, sndBufferSize/1024);
 }
 
 static int parse_url(char *_url, struct_url* res, enum url_flags flag)
@@ -1450,7 +1434,6 @@ static int parse_url(char *_url, struct_url* res, enum url_flags flag)
 	}
 
 
-#ifdef USE_AUTH
 	/* Get user and password */
 	if (res->auth)
 		free(res->auth);
@@ -1460,7 +1443,6 @@ static int parse_url(char *_url, struct_url* res, enum url_flags flag)
 	} else {
 		res->auth = 0;
 	}
-#endif /* USE_AUTH */
 
 	/* Get port number. */
 	int host_end = path_start;
@@ -1514,7 +1496,7 @@ static void usage(void)
 {
 	fprintf(stderr, "%s >>> Version: %s <<<\n", __FILE__, VERSION);
 	fprintf(stderr, "usage:  %s [-c [console]] "
-	    "[-a file] [-d n] [-5] [-2] [-b bs] [-o order]"
+	    "[-a file] [-d n] [-5] [-2] [-b bs] [-o order] [-D] [-R] [-S]"
 	    "[-f] [-t timeout] [-r n] url mount-parameters\n\n", argv0);
 	fprintf(stderr, "\t -2 \tAllow RSA-MD2 server certificate\n");
 	fprintf(stderr, "\t -5 \tAllow RSA-MD5 server certificate\n");
@@ -1525,9 +1507,9 @@ static void usage(void)
 	fprintf(stderr, "\t -f \tstay in foreground - do not fork\n");
 	fprintf(stderr, "\t -b \tCCOW chunk size in bytes (default 131072, power of 2)\n");
 	fprintf(stderr, "\t -o \tCCOW btree order (default 256)\n");
-#ifdef RETRY_ON_RESET
-	fprintf(stderr, "\t -r \tnumber of times to retry connection on reset\n\t\t(default: %i)\n", RESET_RETRIES);
-#endif
+	fprintf(stderr, "\t -R \toverride socket receive buffer size\n");
+	fprintf(stderr, "\t -S \toverride socket send buffer size\n");
+	fprintf(stderr, "\t -r \tnumber of times to retry connection on reset (default: %i)\n", RESET_RETRIES);
 	fprintf(stderr, "\t -t \tset socket timeout in seconds (default: %i)\n", TIMEOUT);
 	fprintf(stderr, "\tmount-parameters should include the mount point and FUSE -o parameters\n");
 }
@@ -1594,12 +1576,18 @@ int main(int argc, char *argv[])
 					  return 4;
 				  shift;
 				  break;
-#ifdef RETRY_ON_RESET
+			case 'R': if (convert_num(&main_url.rcv_buf_size, argv))
+					  return 4;
+				  shift;
+				  break;
+			case 'S': if (convert_num(&main_url.snd_buf_size, argv))
+					  return 4;
+				  shift;
+				  break;
 			case 'r': if (convert_num(&main_url.retry_reset, argv))
 					  return 4;
 				  shift;
 				  break;
-#endif
 			case 't': if (convert_num(&main_url.timeout, argv))
 					  return 4;
 				  shift;
@@ -1622,13 +1610,13 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "invalid url: %s\n", argv[1]);
 		return 2;
 	}
-	print_url(stderr, &main_url);
 	int sockfd = open_client_socket(&main_url);
 	if (sockfd < 0) {
 		fprintf(stderr, "Connection failed.\n");
 		return 3;
 	}
 	else {
+		print_url(stderr, &main_url);
 		print_ssl_info(main_url.ss);
 	}
 	close_client_socket(&main_url);
@@ -1961,6 +1949,14 @@ static int open_client_socket(struct_url *url) {
 	if (connect(url->sockfd, (struct sockaddr*) &sa, sa_len) < 0) {
 		errno_report("couldn't connect socket");
 		return -1;
+	}
+	if (url->snd_buf_size) {
+		int sndbuf = (int)url->snd_buf_size;
+		setsockopt(url->sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+	}
+	if (url->rcv_buf_size) {
+		int rcvbuf = (int)url->rcv_buf_size;
+		setsockopt(url->sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 	}
 
 	if ((url->proto) == PROTO_HTTPS) {
@@ -2315,11 +2311,9 @@ req:
 	}
 	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 	    "Connection: keep-alive\r\n");
-#ifdef USE_AUTH
 	if (url->auth)
 		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 		    "Authorization: Basic %s\r\n", url->auth);
-#endif
 	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes, "\r\n");
 
 	trace("=== HTTP HDR ctx=%p ===\r\n%s", url, buf);
@@ -2342,7 +2336,6 @@ req:
 		errno = 0;
 		res = write_client_socket(url, buf, bytes);
 
-#ifdef RETRY_ON_RESET
 		if ((errno == ECONNRESET) && (url->resets < url->retry_reset)) {
 			errno_report("exchange: sleeping");
 			sleep(1U << url->resets);
@@ -2352,7 +2345,6 @@ req:
 			continue;
 		}
 		url->resets = 0;
-#endif
 		if (CONNFAIL) {
 			errno_report("exchange: failed to send request, retrying");
 			if (close_client_force(url) == -EAGAIN)
@@ -2382,7 +2374,6 @@ req:
 			res = read_client_socket(url, buf, HEADER_SIZE);
 		}
 
-#ifdef RETRY_ON_RESET
 		if ((errno == ECONNRESET) && (url->resets < url->retry_reset)) {
 			errno_report("exchange: sleeping");
 			sleep(1U << url->resets);
@@ -2392,7 +2383,6 @@ req:
 			continue;
 		}
 		url->resets = 0;
-#endif
 		if (CONNFAIL) {
 			errno_report("exchange: did not receive a reply, retrying");
 			sleep(1);
