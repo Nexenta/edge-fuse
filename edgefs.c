@@ -73,6 +73,8 @@
 #define RETRY_ON_RESET
 #endif
 
+#define CHUNK_SIZE 131072
+#define BTREE_ORDER 256
 #define TIMEOUT 30
 #define CONSOLE "/dev/console"
 #define HEADER_SIZE 4096
@@ -110,6 +112,8 @@ typedef struct url {
 	long retry_reset; /*retry reset connections*/
 	long resets;
 #endif
+	long chunk_size;
+	long btree_order;
 	int need_finalize;
 	int sockfd;
 	enum sock_state sock_type;
@@ -850,6 +854,7 @@ static void edgefs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 		return;
 	}
 
+	url->need_finalize = 0;
 	char *out_buf = malloc(size);
 	if ((res = get_data(url, off, size, out_buf)) < 0) {
 		assert(errno);
@@ -869,6 +874,7 @@ static void edgefs_write(fuse_req_t req, fuse_ino_t ino,
 	struct_url *url = (struct_url *)fi->fh;
 	ssize_t res;
 
+	url->need_finalize = 0;
 	res = post_data(url, data, off, size);
 	if (res < 0)
 		fuse_reply_err(req, EIO);
@@ -885,6 +891,7 @@ static void edgefs_release(fuse_req_t req, fuse_ino_t ino,
 	struct_url *url = (struct_url *)fi->fh;
 	ssize_t res;
 
+	url->need_finalize = 1;
 	res = post_data(url, NULL, 0, 0);
 	if (res < 0)
 		fuse_reply_err(req, errno);
@@ -902,6 +909,7 @@ static void edgefs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
 	struct_url *url = (struct_url *)fi->fh;
 	ssize_t res;
 
+	url->need_finalize = 1;
 	res = post_data(url, NULL, 0, 0);
 	if (res < 0)
 		fuse_reply_err(req, errno);
@@ -932,6 +940,7 @@ static void edgefs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 	url->sock_type = SOCK_KEEPALIVE;
 	fi->fh = (uint64_t)url;
 
+	url->need_finalize = 1;
 	url->truncate = 1;
 	res = post_data(url, NULL, 0, 0);
 	if (res < 0) {
@@ -973,6 +982,7 @@ static void edgefs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 	}
 
 	struct_url *url = create_url_copy(INODE_TO_URL(ino), NULL);
+	url->need_finalize = 1;
 	del_data(url);
 	destroy_url_copy(url);
 	fuse_reply_err(req, 0);
@@ -1327,6 +1337,8 @@ static int init_url(struct_url* url)
 	memset(url, 0, sizeof(*url));
 	url->sock_type = SOCK_CLOSED;
 	url->timeout = TIMEOUT;
+	url->chunk_size = CHUNK_SIZE;
+	url->btree_order = BTREE_ORDER;
 #ifdef RETRY_ON_RESET
 	url->retry_reset = RESET_RETRIES;
 #endif
@@ -1499,7 +1511,7 @@ static void usage(void)
 {
 	fprintf(stderr, "%s >>> Version: %s <<<\n", __FILE__, VERSION);
 	fprintf(stderr, "usage:  %s [-c [console]] "
-	    "[-a file] [-d n] [-5] [-2] "
+	    "[-a file] [-d n] [-5] [-2] [-b bs] [-o order]"
 	    "[-f] [-t timeout] [-r n] url mount-parameters\n\n", argv0);
 	fprintf(stderr, "\t -2 \tAllow RSA-MD2 server certificate\n");
 	fprintf(stderr, "\t -5 \tAllow RSA-MD5 server certificate\n");
@@ -1507,6 +1519,8 @@ static void usage(void)
 	fprintf(stderr, "\t -c \tuse console for standard input/output/error\n\t\t(default: %s)\n", CONSOLE);
 	fprintf(stderr, "\t -d \tdebug level (default 0)\n");
 	fprintf(stderr, "\t -f \tstay in foreground - do not fork\n");
+	fprintf(stderr, "\t -b \tCCOW chunk size in bytes (default 131072, power of 2)\n");
+	fprintf(stderr, "\t -o \tCCOW btree order (default 256)\n");
 #ifdef RETRY_ON_RESET
 	fprintf(stderr, "\t -r \tnumber of times to retry connection on reset\n\t\t(default: %i)\n", RESET_RETRIES);
 #endif
@@ -1563,6 +1577,14 @@ int main(int argc, char *argv[])
 				  shift;
 				  break;
 			case 'd': if (convert_num(&main_url.log_level, argv))
+					  return 4;
+				  shift;
+				  break;
+			case 'b': if (convert_num(&main_url.chunk_size, argv))
+					  return 4;
+				  shift;
+				  break;
+			case 'o': if (convert_num(&main_url.btree_order, argv))
 					  return 4;
 				  shift;
 				  break;
@@ -2116,6 +2138,11 @@ parse_header(struct_url *url, const char *buf, size_t bytes,
 			url->sid = NULL;
 			return -EAGAIN;
 		}
+		if (status == 429) {
+			/* retry with finalize */
+			url->need_finalize = 1;
+			return -EAGAIN;
+		}
 		if (status == 404)
 			errno = ENOENT;
 		else {
@@ -2235,9 +2262,14 @@ exchange(struct_url *url, char *buf, const char *method,
 	int is_post = strcmp(method, "POST") == 0;
 	int is_del = strcmp(method, "DELETE") == 0;
 	int is_head = strcmp(method, "HEAD") == 0;
-	int is_finalize = !range && (!is_head || url->need_finalize);
+	int is_finalize;
 	intmax_t len = range ? ((intmax_t)end - (intmax_t)start + 1) : 0;
 	char fullpath[2048];
+
+req:
+
+	is_finalize = url->need_finalize;
+	url->need_finalize = 0;
 
 	if (*url->name)
 		sprintf(fullpath, "%s/%s", url->path, url->name);
@@ -2245,7 +2277,7 @@ exchange(struct_url *url, char *buf, const char *method,
 		sprintf(fullpath, "%s", url->path);
 		is_finalize = 1; /* bucket op - always finalize */
 	}
-req:
+
 	/* Build request buffer, starting with the request method. */
 
 	bytes = (size_t)snprintf(buf, HEADER_SIZE, "%s %s?comp=%s%s HTTP/1.1\r\nHost: %s:%d\r\n",
@@ -2255,6 +2287,9 @@ req:
 	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 	    "x-ccow-offset: %" PRIdMAX "\r\nx-ccow-length: %" PRIdMAX "\r\n",
 	    (intmax_t)start, len);
+	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
+	    "x-ccow-chunkmap-chunk-size: %" PRIdMAX "\r\nx-ccow-chunkmap-btree-order: %" PRIdMAX "\r\n",
+	    url->chunk_size, url->btree_order);
 	if (strcmp(comp, "kv") == 0)
 		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 		    "Content-Type: text/csv\r\n");
