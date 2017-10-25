@@ -41,6 +41,7 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <assert.h>
 #include <ctype.h>
 #include <sys/stat.h>
@@ -264,6 +265,335 @@ static char *b64_encode(unsigned const char* ptr, long len) {
 
 #endif /* USE_AUTH */
 
+/* public domain sha256 implementation based on fips180-3 */
+struct sha256 {
+	uint64_t len;    /* processed message length */
+	uint32_t h[8];   /* hash state */
+	uint8_t buf[64]; /* message block buffer */
+};
+enum { SHA256_DIGEST_LENGTH = 32 };
+
+static uint32_t ror(uint32_t n, int k) { return (n >> k) | (n << (32-k)); }
+#define Ch(x,y,z)  (z ^ (x & (y ^ z)))
+#define Maj(x,y,z) ((x & y) | (z & (x | y)))
+#define S0(x)      (ror(x,2) ^ ror(x,13) ^ ror(x,22))
+#define S1(x)      (ror(x,6) ^ ror(x,11) ^ ror(x,25))
+#define R0(x)      (ror(x,7) ^ ror(x,18) ^ (x>>3))
+#define R1(x)      (ror(x,17) ^ ror(x,19) ^ (x>>10))
+
+static const uint32_t K[64] = {
+	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+static void
+processblock(struct sha256 *s, const uint8_t *buf)
+{
+	uint32_t W[64], t1, t2, a, b, c, d, e, f, g, h;
+	int i;
+
+	for (i = 0; i < 16; i++) {
+		W[i] = (uint32_t)buf[4*i]<<24;
+		W[i] |= (uint32_t)buf[4*i+1]<<16;
+		W[i] |= (uint32_t)buf[4*i+2]<<8;
+		W[i] |= buf[4*i+3];
+	}
+	for (; i < 64; i++)
+		W[i] = R1(W[i-2]) + W[i-7] + R0(W[i-15]) + W[i-16];
+	a = s->h[0];
+	b = s->h[1];
+	c = s->h[2];
+	d = s->h[3];
+	e = s->h[4];
+	f = s->h[5];
+	g = s->h[6];
+	h = s->h[7];
+	for (i = 0; i < 64; i++) {
+		t1 = h + S1(e) + Ch(e,f,g) + K[i] + W[i];
+		t2 = S0(a) + Maj(a,b,c);
+		h = g;
+		g = f;
+		f = e;
+		e = d + t1;
+		d = c;
+		c = b;
+		b = a;
+		a = t1 + t2;
+	}
+	s->h[0] += a;
+	s->h[1] += b;
+	s->h[2] += c;
+	s->h[3] += d;
+	s->h[4] += e;
+	s->h[5] += f;
+	s->h[6] += g;
+	s->h[7] += h;
+}
+
+static void
+pad(struct sha256 *s)
+{
+	unsigned r = s->len % 64;
+
+	s->buf[r++] = 0x80;
+	if (r > 56) {
+		memset(s->buf + r, 0, 64 - r);
+		r = 0;
+		processblock(s, s->buf);
+	}
+	memset(s->buf + r, 0, 56 - r);
+	s->len *= 8;
+	s->buf[56] = (uint8_t)(s->len >> 56);
+	s->buf[57] = (uint8_t)(s->len >> 48);
+	s->buf[58] = (uint8_t)(s->len >> 40);
+	s->buf[59] = (uint8_t)(s->len >> 32);
+	s->buf[60] = (uint8_t)(s->len >> 24);
+	s->buf[61] = (uint8_t)(s->len >> 16);
+	s->buf[62] = (uint8_t)(s->len >> 8);
+	s->buf[63] = (uint8_t)(s->len);
+	processblock(s, s->buf);
+}
+
+void
+sha256_init(void *ctx)
+{
+	struct sha256 *s = ctx;
+	s->len = 0;
+	s->h[0] = 0x6a09e667;
+	s->h[1] = 0xbb67ae85;
+	s->h[2] = 0x3c6ef372;
+	s->h[3] = 0xa54ff53a;
+	s->h[4] = 0x510e527f;
+	s->h[5] = 0x9b05688c;
+	s->h[6] = 0x1f83d9ab;
+	s->h[7] = 0x5be0cd19;
+}
+
+void
+sha256_sum(void *ctx, uint8_t md[SHA256_DIGEST_LENGTH])
+{
+	struct sha256 *s = ctx;
+	int i;
+
+	pad(s);
+	for (i = 0; i < 8; i++) {
+		md[4*i] = (uint8_t)(s->h[i] >> 24);
+		md[4*i+1] = (uint8_t)(s->h[i] >> 16);
+		md[4*i+2] = (uint8_t)(s->h[i] >> 8);
+		md[4*i+3] = (uint8_t)(s->h[i]);
+	}
+}
+
+void
+sha256_update(void *ctx, const void *m, unsigned long len)
+{
+	struct sha256 *s = ctx;
+	const uint8_t *p = m;
+	unsigned r = s->len % 64;
+
+	s->len += len;
+	if (r) {
+		if (len < 64 - r) {
+			memcpy(s->buf + r, p, len);
+			return;
+		}
+		memcpy(s->buf + r, p, 64 - r);
+		len -= 64 - r;
+		p += 64 - r;
+		processblock(s, s->buf);
+	}
+	for (; len >= 64; len -= 64, p += 64)
+		processblock(s, p);
+	memcpy(s->buf, p, len);
+}
+
+#define BLOCK_LENGTH 64U
+#define INNER_PADDING '\x36'
+#define OUTER_PADDING '\x5c'
+
+#define SHA256_DIGEST_LENGTH 32
+#define SHA256_DIGEST_HEX_LENGTH (SHA256_DIGEST_LENGTH *2)+4
+
+#define AWS_KEY_PREFIX "AWS4"
+#define AWS_ALGORITHM "AWS4-HMAC-SHA256"
+#define AWS_SIGNED_HEADERS "host;x-amz-date"
+#define AWS_REQUEST_TYPE "aws4_request"
+#define AWS_DATE_LABEL "x-amz-date"
+
+typedef struct {
+	const char * method;
+	const char * aws_region;
+	const char * aws_endpt_prefix;
+	const char * aws_service;
+	const char * aws_shadow_id;
+	const char * aws_access_key;
+	const char * aws_secret_key;
+	const char * date_time_stamp;
+	const char * payload;
+} aws_signing_inputs;
+
+typedef struct {
+	char date_header[32];
+	char auth_header[256];
+	char aws_host[64];
+	char canonical_uri[64];
+} aws_signing_outputs;
+
+void init_inputs(aws_signing_inputs *input)
+{
+	//set defaults:
+	input->method = "GET";
+	input->payload = NULL;
+	input->aws_region = "us-east-1";
+	input->aws_service = "s3";
+	//clear mandatory params:
+	input->aws_endpt_prefix = NULL;
+	input->aws_shadow_id = NULL;
+	input->aws_access_key = NULL;
+	input->aws_secret_key = NULL;
+	input->date_time_stamp = NULL;
+	return;
+}
+
+void hmac_gen( const uint8_t * const input_key, const uint8_t key_length,
+    uint8_t * const msg, uint8_t hmac_out[SHA256_DIGEST_LENGTH])
+{
+	uint8_t key[ BLOCK_LENGTH ];
+	uint8_t inner_key[ BLOCK_LENGTH ];
+	uint8_t outer_key[ BLOCK_LENGTH ];
+	struct sha256 inner_s;
+	struct sha256 outer_s;
+	uint8_t inner_hash[ SHA256_DIGEST_LENGTH ];
+
+	memcpy( key, input_key, key_length );
+	memset( key + key_length, '\0', BLOCK_LENGTH - key_length );
+
+	for( size_t i = 0; i < BLOCK_LENGTH; i++ ) {
+		inner_key[ i ] = key[ i ] ^ INNER_PADDING;
+		outer_key[ i ] = key[ i ] ^ OUTER_PADDING;
+	}
+	sha256_init( &inner_s );
+	sha256_update( &inner_s, inner_key, BLOCK_LENGTH );
+
+	sha256_update( &inner_s, msg, strlen( (char *) msg ) );
+
+	memset( inner_hash, 0, SHA256_DIGEST_LENGTH );
+	sha256_sum( &inner_s, inner_hash );
+
+	sha256_init( &outer_s );
+	sha256_update( &outer_s, outer_key, BLOCK_LENGTH );
+	sha256_update( &outer_s, inner_hash, SHA256_DIGEST_LENGTH );
+
+	memset( hmac_out, 0, SHA256_DIGEST_LENGTH );
+	sha256_sum( &outer_s, hmac_out );
+
+#ifdef VERBOSE_SIGNING_KEY
+	printf("msg: %s   -- key_length: %02d   -- hmac: ", (char*) msg, key_length);
+	for( size_t i = 0; i < SHA256_DIGEST_LENGTH; i++ )
+		printf( "%02x", hmac_out[ i ] );
+	putchar( '\n' );
+#endif
+}
+
+void hash_sha256_hex_gen (const char * const input, char * hex_out)
+{
+	uint8_t digest[SHA256_DIGEST_LENGTH];
+	struct sha256 digest_s;
+	sha256_init( &digest_s );
+	if (input != NULL)
+		sha256_update( &digest_s, (uint8_t *)input, strlen(input) );
+	sha256_sum( &digest_s, digest );
+	hex_out[0] = '\0';
+	for( size_t i = 0; i < SHA256_DIGEST_LENGTH; i++ )
+		sprintf(hex_out, "%s%02x", hex_out, digest[ i ] );
+}
+
+int generate_aignature(aws_signing_inputs *in, aws_signing_outputs *out) {
+
+	if (in->aws_endpt_prefix == NULL)
+		return -1;
+	if (in->aws_shadow_id == NULL)
+		return -2;
+	if (in->aws_access_key == NULL)
+		return -3;
+	if (in->aws_secret_key == NULL)
+		return -4;
+	if (in->date_time_stamp == NULL)
+		return -5;
+
+	char datestamp[12];
+	memset(datestamp, '\0', 12);
+	strncpy(datestamp, in->date_time_stamp, 8);
+
+	// ************* TASK 1: CREATE A CANONICAL REQUEST *************
+	sprintf(out->canonical_uri, "/things/%s/shadow", in->aws_shadow_id);
+
+	sprintf(out->aws_host, "%s.iot.%s.amazonaws.com", in->aws_endpt_prefix, in->aws_region);
+
+	char canonical_headers[128];// = 'host:' + host + '\n' + 'x-amz-date:' + amzdate + '\n'
+	sprintf(canonical_headers, "host:%s\n%s:%s\n", out->aws_host, AWS_DATE_LABEL, in->date_time_stamp);
+
+	char hmac_payload_hex[ SHA256_DIGEST_HEX_LENGTH ];
+	hash_sha256_hex_gen(in->payload, hmac_payload_hex);
+
+	char canonical_request[256]; //= method + '\n' + canonical_uri + '\n' + canonical_querystring + '\n' + canonical_headers + '\n' + signed_headers + '\n' + payload_hmac
+	sprintf(canonical_request, "%s\n%s\n\n%s\n%s\n%s", in->method, out->canonical_uri, canonical_headers, AWS_SIGNED_HEADERS, hmac_payload_hex);
+
+	char hmac_canonical_request_hex[SHA256_DIGEST_HEX_LENGTH];
+	hash_sha256_hex_gen(canonical_request, hmac_canonical_request_hex);
+
+
+	//# ************* TASK 2: CREATE THE STRING TO SIGN *************
+	char credential_scope[64];
+	sprintf(credential_scope, "%s/%s/%s/%s", datestamp, in->aws_region, in->aws_service, AWS_REQUEST_TYPE);
+
+	char string_to_sign[256]; //= algorithm + '\n' +  amzdate + '\n' +  credential_scope + '\n' +  hashlib.sha256(canonical_request).hexdigest()
+	sprintf(string_to_sign, "%s\n%s\n%s\n%s", AWS_ALGORITHM, in->date_time_stamp, credential_scope, hmac_canonical_request_hex);
+
+
+	//# ************* TASK 3: CALCULATE THE SIGNATURE *************
+	//generate signing key
+	uint8_t hmac_signing_interim[ SHA256_DIGEST_LENGTH];
+	uint8_t hmac_signing_key[ SHA256_DIGEST_LENGTH];
+	char prefixed_secret_key[64] = AWS_KEY_PREFIX;
+	strcat(prefixed_secret_key,in->aws_secret_key);
+	hmac_gen( (uint8_t *) prefixed_secret_key, (uint8_t)strlen(prefixed_secret_key), (uint8_t *)datestamp, hmac_signing_interim);
+	// key for next step is the hmac from the previous step, 32 bytes (SHA256_DIGEST_LENGTH) hmac_gen will normalize the key to the BLOCK_LENGTH (64)
+	hmac_gen( (uint8_t *) &hmac_signing_interim, SHA256_DIGEST_LENGTH, (uint8_t *)in->aws_region, hmac_signing_interim);
+	hmac_gen( (uint8_t *) &hmac_signing_interim, SHA256_DIGEST_LENGTH, (uint8_t *)in->aws_service, hmac_signing_interim);
+	hmac_gen( (uint8_t *) &hmac_signing_interim, SHA256_DIGEST_LENGTH, (uint8_t *)AWS_REQUEST_TYPE, hmac_signing_key);
+	// the previous step produces the signing_key
+
+	//then sign the signature
+	uint8_t hmac_signature[ SHA256_DIGEST_LENGTH ];
+	hmac_gen( (uint8_t *) &hmac_signing_key, SHA256_DIGEST_LENGTH, (uint8_t *)string_to_sign, hmac_signature);
+	char hmac_signature_hex[SHA256_DIGEST_HEX_LENGTH];
+	memset(hmac_signature_hex, '\0', 4);
+	for( size_t i = 0; i < SHA256_DIGEST_LENGTH; i++ )
+		sprintf(hmac_signature_hex, "%s%02x", hmac_signature_hex, hmac_signature[ i ] );
+
+	//# ************* TASK 4: ADD SIGNING INFORMATION TO THE REQUEST [headers] *************
+	sprintf(out->auth_header, "Authorization: %s Credential=%s/%s, SignedHeaders=%s, Signature=%s", AWS_ALGORITHM, in->aws_access_key, credential_scope, AWS_SIGNED_HEADERS, hmac_signature_hex);
+
+	sprintf(out->date_header, "%s: %s", AWS_DATE_LABEL, in->date_time_stamp);
+
+	trace("canonical_headers length: %03d  value: %s\n", (int) strlen(canonical_headers), canonical_headers);
+	trace("canonical_request length: %03d  value: %s\n", (int) strlen(canonical_request), canonical_request);
+	trace("canonical_request hmac hex: %s\n", hmac_canonical_request_hex);
+	trace("credential_scope length: %03d  value: %s\n", (int) strlen(credential_scope), credential_scope);
+	trace("string_to_sign length: %03d  value: %s\n", (int) strlen(string_to_sign), string_to_sign);
+	trace("signature hmac hex: %s\n", hmac_signature_hex);
+
+	return 0;
+}
+
+/* hashtable implementation */
 pthread_mutex_t tab_mutex;
 struct hsearch_data tab = {0};
 
@@ -425,6 +755,10 @@ static void dirbuf_add(fuse_req_t req, struct dirbuf *b, const char *name,
 	b->p = (char *) realloc(b->p, b->size);
 	memset(&stbuf, 0, sizeof(stbuf));
 	stbuf.st_ino = ino;
+	if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+		stbuf.st_mtime = main_url.last_modified;
+		stbuf.st_size = main_url.file_size;
+	}
 	fuse_add_direntry(req, b->p + oldsize, b->size - oldsize, name, &stbuf,
 	    (off_t) b->size);
 }
@@ -458,17 +792,8 @@ static void edgefs_readdir(fuse_req_t req, fuse_ino_t dir_ino, size_t size,
 
 	struct_url *url = create_url_copy(&main_url, NULL);
 
-	if (url->req_buf
-	    && ( (url->req_buf_size < size)
-		    || ( (url->req_buf_size > size)
-			    && (url->req_buf_size > MAX_REQUEST)))) {
-		free(url->req_buf);
-		url->req_buf = 0;
-	}
-	if (!url->req_buf) {
-		url->req_buf_size = size;
-		url->req_buf = malloc(size);
-	}
+	url->req_buf_size = size;
+	url->req_buf = malloc(size);
 
 	memset(&b, 0, sizeof(b));
 	dirbuf_add(req, &b, ".", 1);
@@ -1004,6 +1329,9 @@ static int free_url(struct_url* url)
 	url->name = 0;
 	if (url->sid) free(url->sid);
 	url->sid = 0;
+	if (url->req_buf) free(url->req_buf);
+	url->req_buf = 0;
+	url->req_buf_size = 0;
 #ifdef USE_AUTH
 	if (url->auth) free(url->auth);
 	url->auth = 0;
