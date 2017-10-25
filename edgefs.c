@@ -687,6 +687,8 @@ static int edgefs_stat(fuse_ino_t ino, struct fuse_file_info *fi,
 	stbuf->st_ino = ino;
 
 	if (ino == 1) {
+		stbuf->st_mtime = main_url.last_modified;
+		stbuf->st_size = main_url.file_size;
 		stbuf->st_mode = S_IFDIR | 0755;
 		stbuf->st_nlink = 2;
 		return 0;
@@ -988,9 +990,24 @@ static void edgefs_init(void *userdata, struct fuse_conn_info *conn)
 	conn->max_readahead = 131072;
 }
 
+static void edgefs_statfs(fuse_req_t req, fuse_ino_t ino)
+{
+	struct statvfs buf;
+
+	trace("statfs ino=%lx\n", ino);
+
+	memset(&buf, 0, sizeof(buf));
+
+	buf.f_namemax = 1024;
+	buf.f_bsize = 4096;
+
+	fuse_reply_statfs(req, &buf);
+}
+
 static struct fuse_lowlevel_ops edgefs_oper = {
 	.init               = edgefs_init,
 	.lookup             = edgefs_lookup,
+	.statfs             = edgefs_statfs,
 	.getattr            = edgefs_getattr,
 	.setattr            = edgefs_setattr,
 	.readdir            = edgefs_readdir,
