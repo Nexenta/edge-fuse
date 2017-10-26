@@ -89,6 +89,14 @@ enum url_flags {
 	URL_DROP,
 };
 
+#define ACCESS_KEY_LEN 24
+#define SECRET_KEY_LEN 48
+
+typedef struct access_keys_ {
+	char access[ACCESS_KEY_LEN];
+	char secret[SECRET_KEY_LEN];
+} access_keys_t;
+
 typedef struct url {
 	int proto;
 	long timeout;
@@ -97,6 +105,7 @@ typedef struct url {
 	int port;
 	char *path; /*get path*/
 	char *name; /*file name*/
+	access_keys_t *access_keys;
 	char *auth; /*encoded auth data*/
 	long retry_reset; /*retry reset connections*/
 	long resets;
@@ -1383,6 +1392,8 @@ static int free_url(struct_url* url)
 	url->req_buf_size = 0;
 	if (url->auth) free(url->auth);
 	url->auth = 0;
+	if (url->access_keys)
+		free(url->access_keys);
 	pthread_mutex_destroy(&url->sid_mutex);
 	url->port = 0;
 	url->proto = 0; /* only after socket closed */
@@ -1568,7 +1579,33 @@ static int convert_num(long * num, char ** argv)
 	return 0;
 }
 
+int
+retrieve_access_key(struct_url *main_url, char **argv)
+{
+	if ( (!main_url) || (!argv[1]) )
+		return -EFAULT;
 
+	char colon = ':';
+	char *keys = argv[1];
+	size_t total_len = strlen(keys);
+	char *aPtr = strchr(keys, colon);
+	if (aPtr == NULL) {
+		return -EFAULT;
+	}
+	aPtr++;
+	size_t len = (size_t) (aPtr - keys);
+	if (main_url->access_keys == NULL) {
+		main_url->access_keys = calloc(1, sizeof(access_keys_t));
+		if (!main_url->access_keys)
+			return -ENOMEM;
+	}
+	memcpy(&main_url->access_keys->access, keys, len - 1 );
+	main_url->access_keys->access[len] = '\0';
+	memcpy(&main_url->access_keys->secret, aPtr, total_len - len);
+	main_url->access_keys->secret[total_len - len] = '\0';
+
+	return 0;
+}
 
 int main(int argc, char *argv[])
 {
@@ -1578,6 +1615,7 @@ int main(int argc, char *argv[])
 	argv0 = argv[0];
 	init_url(&main_url);
 	strncpy(main_url.tname, "main", TNAME_LEN);
+	int err;
 
 	while( argv[1] && (*(argv[1]) == '-'))
 	{
@@ -1625,6 +1663,14 @@ int main(int argc, char *argv[])
 				  break;
 			case 't': if (convert_num(&main_url.timeout, argv))
 					  return 4;
+				  shift;
+				  break;
+			case 'k':
+				  err = retrieve_access_key(&main_url, argv);
+				  if (err) {
+					fprintf(stderr, "Unable to retrieve ACCESS and SECRET : %d\n", err);
+					return 4;
+				  }
 				  shift;
 				  break;
 			case 'f': do_fork = 0;
@@ -1677,7 +1723,7 @@ int main(int argc, char *argv[])
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 	struct fuse_chan *ch;
 	char *mountpoint;
-	int err = -1;
+	err = -1;
 	int fork_res = 0;
 
 	if (fuse_parse_cmdline(&args, &mountpoint, NULL, NULL) != -1 &&
