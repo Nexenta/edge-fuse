@@ -691,12 +691,15 @@ static int edgefs_stat(fuse_ino_t ino, struct fuse_file_info *fi,
 
 	url->need_finalize = (fi == NULL);
 
+	if (fi)
+		pthread_mutex_lock(&url->sid_mutex);
 	res = (get_stat(url, stbuf) == -1) ? -1 : 0;
 	if (!fi) {
 		if (res == 0)
 			INODE_TO_URL(ino)->file_size = url->file_size;
 		destroy_url_copy(url);
-	}
+	} else
+		pthread_mutex_unlock(&url->sid_mutex);
 	return res;
 }
 
