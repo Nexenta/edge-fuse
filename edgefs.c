@@ -143,10 +143,11 @@ struct dirbuf {
 
 static off_t get_stat(struct_url*, struct stat * stbuf);
 static ssize_t get_data(struct_url*, off_t start, size_t size, char *dest);
+static int copy_object(struct_url *url_from, struct_url *url_to);
 static ssize_t post_data(struct_url *url, const char *data, off_t start, size_t size);
 static ssize_t list_data(struct_url *url, off_t off, size_t size,
     fuse_req_t req, struct dirbuf *b);
-static int del_data(struct_url *url);
+static int del_object(struct_url *url);
 static int open_client_socket(struct_url *url);
 static int close_client_socket(struct_url *url);
 static int close_client_force(struct_url *url);
@@ -973,7 +974,7 @@ static void edgefs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 
 	struct_url *url = create_url_copy(INODE_TO_URL(ino), NULL);
 	url->need_finalize = 1;
-	del_data(url);
+	del_object(url);
 	destroy_url_copy(url);
 	fuse_reply_err(req, 0);
 }
@@ -1004,6 +1005,36 @@ static void edgefs_statfs(fuse_req_t req, fuse_ino_t ino)
 	fuse_reply_statfs(req, &buf);
 }
 
+static void edgefs_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
+			fuse_ino_t newparent, const char *newname)
+{
+	trace("rename from %s to %s\n", name, newname);
+
+	fuse_ino_t ino = newino((char*)name);
+	struct_url *url_from = create_url_copy(INODE_TO_URL(ino), NULL);
+
+	struct_url *url_to = create_url_copy(&main_url, (char*)newname);
+	if (url_to->name)
+		free(url_to->name);
+	url_to->name = strdup(newname);
+
+	if (url_from->sid)
+		pthread_mutex_lock(&url_from->sid_mutex);
+	int res = copy_object(url_from, url_to);
+	if (res < 0) {
+		if (url_from->sid)
+			pthread_mutex_unlock(&url_from->sid_mutex);
+		fuse_reply_err(req, errno);
+		return;
+	}
+	del_object(url_from);
+	if (url_from->sid)
+		pthread_mutex_unlock(&url_from->sid_mutex);
+	destroy_url_copy(url_from);
+	destroy_url_copy(url_to);
+	fuse_reply_err(req, 0);
+}
+
 static struct fuse_lowlevel_ops edgefs_oper = {
 	.init               = edgefs_init,
 	.lookup             = edgefs_lookup,
@@ -1019,6 +1050,7 @@ static struct fuse_lowlevel_ops edgefs_oper = {
 	.fsync              = edgefs_fsync,
 	.create             = edgefs_create,
 	.unlink             = edgefs_unlink,
+	.rename             = edgefs_rename,
 };
 
 static int mempref(const char *mem, const char *pref, size_t size, int case_sensitive)
@@ -2044,10 +2076,11 @@ parse_header(struct_url *url, const char *buf, size_t bytes,
 
 	int is_post = strcmp(method, "POST") == 0;
 	int is_del = strcmp(method, "DELETE") == 0;
+	int is_put = strcmp(method, "PUT") == 0;
 	int is_head = strcmp(method, "HEAD") == 0;
 	int is_main_url = *url->name == 0;
 
-	if (is_del) {
+	if (is_del || is_put) {
 		seen_accept = 1;
 		seen_length = 1;
 	}
@@ -2264,6 +2297,7 @@ exchange(struct_url *url, char *buf, const char *method,
 	ssize_t res;
 	size_t bytes;
 	int range = (end > 0);
+	int is_put = strcmp(method, "PUT") == 0;
 	int is_post = strcmp(method, "POST") == 0;
 	int is_del = strcmp(method, "DELETE") == 0;
 	int is_head = strcmp(method, "HEAD") == 0;
@@ -2285,8 +2319,12 @@ req:
 
 	/* Build request buffer, starting with the request method. */
 
-	bytes = (size_t)snprintf(buf, HEADER_SIZE, "%s %s?comp=%s%s HTTP/1.1\r\nHost: %s:%d\r\n",
-	    method, fullpath, comp, (is_finalize ? "&finalize" : ""), url->host, url->port);
+	if (comp)
+		bytes = (size_t)snprintf(buf, HEADER_SIZE, "%s %s?comp=%s%s HTTP/1.1\r\nHost: %s:%d\r\n",
+		    method, fullpath, comp, (is_finalize ? "&finalize" : ""), url->host, url->port);
+	else
+		bytes = (size_t)snprintf(buf, HEADER_SIZE, "%s %s HTTP/1.1\r\nHost: %s:%d\r\n",
+		    method, fullpath, url->host, url->port);
 	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 	    "User-Agent: %s %s\r\n", __FILE__, VERSION);
 	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
@@ -2295,7 +2333,7 @@ req:
 	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 	    "x-ccow-chunkmap-chunk-size: %" PRIdMAX "\r\nx-ccow-chunkmap-btree-order: %" PRIdMAX "\r\n",
 	    url->chunk_size, url->btree_order);
-	if (strcmp(comp, "kv") == 0)
+	if (comp && strcmp(comp, "kv") == 0)
 		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 		    "Content-Type: text/csv\r\n");
 	else if (url->sid)
@@ -2311,6 +2349,10 @@ req:
 		    "Content-Type: application/octet-stream\r\n");
 		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 		    "Content-Length: %" PRIdMAX "\r\n", len);
+	}
+	if (is_put) {
+		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
+		    "%s\r\n", data);
 	}
 	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 	    "Connection: keep-alive\r\n");
@@ -2533,12 +2575,39 @@ static ssize_t post_data(struct_url *url, const char *data, off_t start,
 }
 
 /*
- * del_data does all the magic
+ * copy_object does all the magic
+ * a PUT with copy header request
+ */
+
+static int copy_object(struct_url *url_from, struct_url *url_to)
+{
+	char buf[HEADER_SIZE];
+	char dst[HEADER_SIZE];
+	off_t content_length;
+
+	trace("sid=%s\n", url_from->sid);
+
+	sprintf(dst, "x-amz-copy-source: %s/%s", url_from->path, url_from->name);
+
+	pthread_mutex_lock(&tab_mutex);
+	if (exchange(url_to, buf, "PUT", &content_length, 0, 0, 0, dst, NULL) < 0) {
+		pthread_mutex_unlock(&tab_mutex);
+		return -1;
+	}
+	pthread_mutex_unlock(&tab_mutex);
+
+	close_client_socket(url_to);
+
+	return 0;
+}
+
+/*
+ * del_object does all the magic
  * a DELETE-Request
  * allows to delete an object
  */
 
-static int del_data(struct_url *url)
+static int del_object(struct_url *url)
 {
 	char buf[HEADER_SIZE];
 	off_t content_length;
@@ -2546,8 +2615,10 @@ static int del_data(struct_url *url)
 	trace("sid=%s\n", url->sid);
 
 	pthread_mutex_lock(&tab_mutex);
-	if (exchange(url, buf, "DELETE", &content_length, 0, 0, 0, NULL, "streamsession") < 0)
+	if (exchange(url, buf, "DELETE", &content_length, 0, 0, 0, NULL, NULL) < 0) {
+		pthread_mutex_unlock(&tab_mutex);
 		return -1;
+	}
 	pthread_mutex_unlock(&tab_mutex);
 
 	close_client_socket(url);
