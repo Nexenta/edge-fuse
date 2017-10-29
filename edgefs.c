@@ -682,7 +682,7 @@ static int edgefs_stat(fuse_ino_t ino, struct fuse_file_info *fi,
 {
 	int res;
 
-	trace("ino=%lx\n", ino);
+	trace("ino=%ld\n", ino);
 	stbuf->st_ino = ino;
 
 	if (ino == 1) {
@@ -718,9 +718,8 @@ static void edgefs_getattr(fuse_req_t req, fuse_ino_t ino,
 {
 	struct stat stbuf;
 
-	(void) fi;
+	trace("getattr ino=%ld fi=%p\n", ino, fi);
 
-	trace("getattr ino=%lx\n", ino);
 	memset(&stbuf, 0, sizeof(stbuf));
 	if (edgefs_stat(ino, fi, &stbuf) < 0)
 		assert(errno),fuse_reply_err(req, errno);
@@ -788,7 +787,7 @@ static void edgefs_readdir(fuse_req_t req, fuse_ino_t dir_ino, size_t size,
 	struct dirbuf b;
 	ssize_t res;
 
-	trace("readdir ino=%lx\n", dir_ino);
+	trace("readdir ino=%ld\n", dir_ino);
 	if (dir_ino != 1) {
 		fuse_reply_err(req, ENOTDIR);
 		return;
@@ -814,13 +813,32 @@ static void edgefs_readdir(fuse_req_t req, fuse_ino_t dir_ino, size_t size,
 	destroy_url_copy(url);
 }
 
+static ssize_t edgefs_trunc(fuse_ino_t ino)
+{
+	trace("truncate ino=%ld\n", ino);
+
+	struct_url *url = create_url_copy(INODE_TO_URL(ino), NULL);
+	url->truncate = 1;
+	url->need_finalize = 1;
+	ssize_t res = post_data(url, NULL, 0, 0);
+	destroy_url_copy(url);
+	return res;
+}
+
 static void edgefs_open(fuse_req_t req, fuse_ino_t ino,
     struct fuse_file_info *fi)
 {
-	trace("open %lx\n", ino);
+	trace("open ino=%ld trunc=%d\n", ino, fi->flags & O_TRUNC);
 	if (ino == 1)
 		fuse_reply_err(req, EISDIR);
 	else {
+		if (fi->flags & O_TRUNC) {
+			if (edgefs_trunc(ino) < 0) {
+				fuse_reply_err(req, EIO);
+				return;
+			}
+		}
+
 		struct_url *url = create_url_copy(INODE_TO_URL(ino), NULL);
 		int fd = open_client_socket(url);
 		if (fd < 0) {
@@ -828,11 +846,19 @@ static void edgefs_open(fuse_req_t req, fuse_ino_t ino,
 			fuse_reply_err(req, EIO);
 			return;
 		}
+
 		url->sock_type = SOCK_KEEPALIVE;
 		fi->direct_io = url->direct_io;
 		fi->fh = (uint64_t)url;
-		if (fi->flags & O_TRUNC)
-			url->truncate = 1;
+
+		struct stat stbuf;
+		memset(&stbuf, 0, sizeof(stbuf));
+		if (edgefs_stat(ino, fi, &stbuf) < 0) {
+			destroy_url_copy(url);
+			fuse_reply_err(req, errno);
+			return;
+		}
+
 		fuse_reply_open(req, fi);
 	}
 }
@@ -842,7 +868,7 @@ static void edgefs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 {
 	(void) fi;
 
-	trace("read ino=%lx\n", ino);
+	trace("read ino=%ld\n", ino);
 	struct_url *url = (struct_url *)fi->fh;
 	ssize_t res;
 
@@ -869,7 +895,7 @@ static void edgefs_write(fuse_req_t req, fuse_ino_t ino,
 {
 	(void) fi;
 
-	trace("write ino=%lx\n", ino);
+	trace("write ino=%ld\n", ino);
 	struct_url *url = (struct_url *)fi->fh;
 	ssize_t res;
 
@@ -886,7 +912,7 @@ static void edgefs_release(fuse_req_t req, fuse_ino_t ino,
 {
 	(void) fi;
 
-	trace("release ino=%lx\n", ino);
+	trace("release ino=%ld fi=%p\n", ino, fi);
 	struct_url *url = (struct_url *)fi->fh;
 	ssize_t res;
 
@@ -904,7 +930,7 @@ static void edgefs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
 {
 	(void) fi;
 
-	trace("fsync ino=%lx\n", ino);
+	trace("fsync ino=%ld\n", ino);
 	struct_url *url = (struct_url *)fi->fh;
 	ssize_t res;
 
@@ -960,9 +986,7 @@ static void edgefs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 {
 	struct stat stbuf;
 
-	(void) fi;
-
-	trace("setattr ino=%lx\n", ino);
+	trace("setattr ino=%ld\n", ino);
 	memset(&stbuf, 0, sizeof(stbuf));
 	if (edgefs_stat(ino, fi, &stbuf) < 0)
 		assert(errno),fuse_reply_err(req, errno);
@@ -990,7 +1014,7 @@ static void edgefs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 
 static void edgefs_forget(fuse_req_t req, fuse_ino_t ino, unsigned long nlookup)
 {
-	trace("forget ino=%lx %s\n", ino, INODE_TO_URL(ino)->name);
+	trace("forget ino=%ld %s\n", ino, INODE_TO_URL(ino)->name);
 	fuse_reply_none(req);
 }
 
@@ -1004,7 +1028,7 @@ static void edgefs_statfs(fuse_req_t req, fuse_ino_t ino)
 {
 	struct statvfs buf;
 
-	trace("statfs ino=%lx\n", ino);
+	trace("statfs ino=%ld\n", ino);
 
 	memset(&buf, 0, sizeof(buf));
 
