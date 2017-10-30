@@ -117,7 +117,7 @@ typedef struct url {
 	_Bool direct_io;
 	int sockfd;
 	enum sock_state sock_type;
-	int truncate;
+	ssize_t truncate;
 	int redirected;
 	int redirect_followed;
 	int redirect_depth;
@@ -813,12 +813,12 @@ static void edgefs_readdir(fuse_req_t req, fuse_ino_t dir_ino, size_t size,
 	destroy_url_copy(url);
 }
 
-static ssize_t edgefs_trunc(fuse_ino_t ino)
+static ssize_t edgefs_trunc(fuse_ino_t ino, ssize_t newlength)
 {
 	trace("truncate ino=%ld\n", ino);
 
 	struct_url *url = create_url_copy(INODE_TO_URL(ino), NULL);
-	url->truncate = 1;
+	url->truncate = newlength;
 	url->need_finalize = 1;
 	ssize_t res = post_data(url, NULL, 0, 0);
 	destroy_url_copy(url);
@@ -833,7 +833,7 @@ static void edgefs_open(fuse_req_t req, fuse_ino_t ino,
 		fuse_reply_err(req, EISDIR);
 	else {
 		if (fi->flags & O_TRUNC) {
-			if (edgefs_trunc(ino) < 0) {
+			if (edgefs_trunc(ino, -1) < 0) {
 				fuse_reply_err(req, EIO);
 				return;
 			}
@@ -967,7 +967,7 @@ static void edgefs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 	fi->direct_io = url->direct_io;
 
 	url->need_finalize = 1;
-	url->truncate = 1;
+	url->truncate = -1;
 	res = post_data(url, NULL, 0, 0);
 	if (res < 0) {
 		fuse_reply_err(req, errno);
@@ -986,12 +986,21 @@ static void edgefs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 {
 	struct stat stbuf;
 
-	trace("setattr ino=%ld\n", ino);
+	trace("setattr ino=%ld to_set=%d\n", ino, to_set);
 	memset(&stbuf, 0, sizeof(stbuf));
-	if (edgefs_stat(ino, fi, &stbuf) < 0)
-		assert(errno),fuse_reply_err(req, errno);
-	else
-		fuse_reply_attr(req, &stbuf, 1.0);
+
+	if (edgefs_stat(ino, fi, &stbuf) < 0) {
+		fuse_reply_err(req, errno);
+		return;
+	}
+
+	if (to_set & FUSE_SET_ATTR_SIZE) {
+		if (edgefs_trunc(ino, attr->st_size) < 0)
+			fuse_reply_err(req, EIO);
+		stbuf.st_size = attr->st_size;
+	}
+
+	fuse_reply_attr(req, &stbuf, 1.0);
 }
 
 static void edgefs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
@@ -1751,6 +1760,7 @@ int main(int argc, char *argv[])
 	int fork_res = 0;
 
 	if (fuse_parse_cmdline(&args, &mountpoint, NULL, NULL) != -1 &&
+	    !fuse_opt_add_arg(&args, "-odefault_permissions") &&
 	    !fuse_opt_add_arg(&args, "-obig_writes") &&
 	    !fuse_opt_add_arg(&args, "-oatomic_o_trunc") &&
 	    (ch = fuse_mount(mountpoint, &args)) != NULL) {
@@ -2412,6 +2422,9 @@ req:
 	else if (url->truncate) { // CREATE or TRUNCATE (-o atomic_o_trunc)
 		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 		    "x-ccow-object-oflags: 3\r\n");
+		if (url->truncate > 0)
+			bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
+			    "x-ccow-truncate-length: %ld\r\n", url->truncate);
 		url->truncate = 0;
 	}
 	if (is_post) {
