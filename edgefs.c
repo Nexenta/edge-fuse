@@ -55,7 +55,6 @@
 #include <stddef.h>
 #include <inttypes.h>
 #include <linux/tcp.h>
-#include <search.h>
 #include <unistd.h>
 #include <sys/syscall.h>
 
@@ -594,7 +593,175 @@ int generate_aignature(aws_signing_inputs *in, aws_signing_outputs *out) {
 	return 0;
 }
 
-/* hashtable implementation */
+/* hashtable implementation - taken from FreeBSD */
+
+#define __set_errno(ERRNO) errno = ERRNO
+
+typedef    struct entry {
+	char    *key;
+	void    *data;
+} ENTRY;
+
+typedef struct _ENTRY
+{
+	unsigned int used;
+	ENTRY entry;
+} _ENTRY;
+
+typedef    enum {
+	FIND, ENTER
+} ACTION;
+
+struct hsearch_data
+{
+	struct _ENTRY *table;
+	unsigned int size;
+	unsigned int filled;
+};
+
+static int
+isprime (unsigned int number)
+{
+	/* no even number will be passed */
+	unsigned int div = 3;
+
+	while (div * div < number && number % div != 0)
+		div += 2;
+
+	return number % div != 0;
+}
+
+int
+hcreate_r (size_t nel, struct hsearch_data *htab)
+{
+	/* Test for correct arguments.  */
+	if (htab == NULL)
+	{
+		__set_errno (EINVAL);
+		return 0;
+	}
+
+	/* There is still another table active. Return with error. */
+	if (htab->table != NULL)
+		return 0;
+
+	/* Change nel to the first prime number not smaller as nel. */
+	nel |= 1;      /* make odd */
+	while (!isprime ((unsigned)nel))
+		nel += 2;
+
+	htab->size = (unsigned)nel;
+	htab->filled = 0;
+
+	/* allocate memory and zero out */
+	htab->table = (_ENTRY *) calloc (htab->size + 1, sizeof (_ENTRY));
+	if (htab->table == NULL)
+		return 0;
+
+	/* everything went alright */
+	return 1;
+}
+
+void
+hdestroy_r (struct hsearch_data *htab)
+{
+	/* Test for correct arguments.  */
+	if (htab == NULL)
+	{
+		__set_errno (EINVAL);
+		return;
+	}
+
+	/* Free used memory.  */
+	free (htab->table);
+
+	/* the sign for an existing table is an value != NULL in htable */
+	htab->table = NULL;
+}
+
+int
+hsearch_r (ENTRY item, ACTION action, ENTRY **retval, struct hsearch_data *htab)
+{
+	unsigned int hval;
+	unsigned int count;
+	unsigned int len = (unsigned)strlen (item.key);
+	unsigned int idx;
+
+	/* Compute an value for the given string. Perhaps use a better method. */
+	hval = len;
+	count = len;
+	while (count-- > 0)
+	{
+		hval <<= 4;
+		hval += (unsigned)item.key[count];
+	}
+
+	/* First hash function: simply take the modul but prevent zero. */
+	idx = hval % htab->size + 1;
+
+	if (htab->table[idx].used)
+	{
+		/* Further action might be required according to the action value. */
+		if (htab->table[idx].used == hval)
+		{
+			*retval = &htab->table[idx].entry;
+			return 1;
+		}
+
+		/* Second hash function, as suggested in [Knuth] */
+		unsigned int hval2 = 1 + hval % (htab->size - 2);
+		unsigned int first_idx = idx;
+
+		do
+		{
+			/* Because SIZE is prime this guarantees to step through all
+			   available indeces.  */
+			if (idx <= hval2)
+				idx = htab->size + idx - hval2;
+			else
+				idx -= hval2;
+
+			/* If we visited all entries leave the loop unsuccessfully.  */
+			if (idx == first_idx)
+				break;
+
+			/* If entry is found use it. */
+			if (htab->table[idx].used == hval
+			    && strcmp (item.key, htab->table[idx].entry.key) == 0)
+			{
+				*retval = &htab->table[idx].entry;
+				return 1;
+			}
+		}
+		while (htab->table[idx].used);
+	}
+
+	/* An empty bucket has been found. */
+	if (action == ENTER)
+	{
+		/* If table is full and another entry should be entered return
+		   with error.  */
+		if (htab->filled == htab->size)
+		{
+			__set_errno (ENOMEM);
+			*retval = NULL;
+			return 0;
+		}
+
+		htab->table[idx].used  = hval;
+		htab->table[idx].entry = item;
+
+		++htab->filled;
+
+		*retval = &htab->table[idx].entry;
+		return 1;
+	}
+
+	__set_errno (ESRCH);
+	*retval = NULL;
+	return 0;
+}
+
 pthread_mutex_t tab_mutex;
 struct hsearch_data tab = {0};
 
