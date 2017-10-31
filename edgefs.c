@@ -33,7 +33,23 @@
 #define _GNU_SOURCE
 #define __USE_GNU
 
+#if __linux__
+
 #include <fuse_lowlevel.h>
+#include <linux/tcp.h>
+#include <pthread.h>
+
+#endif
+
+#ifdef __APPLE__
+
+#include <fuse/fuse_lowlevel.h>
+#include <pthread/pthread.h>
+#include <netinet/tcp.h>
+
+#endif
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,11 +70,9 @@
 #include <time.h>
 #include <stddef.h>
 #include <inttypes.h>
-#include <linux/tcp.h>
 #include <unistd.h>
 #include <sys/syscall.h>
 
-#include <pthread.h>
 #define FUSE_LOOP fuse_session_loop_mt
 
 #include <gnutls/gnutls.h>
@@ -181,7 +195,12 @@ trace_a(const char *fmt, ...)
 	char msg[2048];
 	struct timeval tp;
 	long pid = getpid();
+#if __linux__
 	long thrid = syscall(SYS_gettid);
+#endif
+#ifdef __APPLE__
+	long thrid = (long) pthread_self();
+#endif
 	time_t meow = time(NULL);
 	char buf[64];
 	struct tm tm;
@@ -818,7 +837,7 @@ static struct_url * create_url_copy(const struct_url * url, char *newname)
 	if (url->auth)
 		res->auth = strdup(url->auth);
 	memset(res->tname, 0, TNAME_LEN + 1);
-	snprintf(res->tname, TNAME_LEN, "%0*lX", TNAME_LEN, pthread_self());
+	snprintf(res->tname, TNAME_LEN, "%0*lX", TNAME_LEN, (long ) pthread_self());
 	pthread_mutex_init((pthread_mutex_t *)&url->sid_mutex, NULL);
 	return res;
 }
@@ -1285,7 +1304,7 @@ static void ssl_error_p(ssize_t error, struct_url * url, const char *where, cons
 /* Functions to deal with gnutls_datum_t stolen from gnutls docs.
  * The structure does not seem documented otherwise.
  */
-static gnutls_datum_t
+gnutls_datum_t
 load_file (const char *file)
 {
 	FILE *f;
@@ -1314,7 +1333,7 @@ load_file (const char *file)
 	return loaded_file;
 }
 
-static void
+void
 unload_file (gnutls_datum_t data)
 {
 	free (data.data);
@@ -1571,7 +1590,9 @@ static int init_url(struct_url* url)
 	url->chunk_size = CHUNK_SIZE;
 	url->btree_order = BTREE_ORDER;
 	url->retry_reset = RESET_RETRIES;
+#if __linux__
 	url->cafile = CERT_STORE;
+#endif
 	return 0;
 }
 
@@ -1746,7 +1767,11 @@ static void usage(void)
 	    "[-f] [-t timeout] [-r n] url mount-parameters\n\n", argv0);
 	fprintf(stderr, "\t -2 \tAllow RSA-MD2 server certificate\n");
 	fprintf(stderr, "\t -5 \tAllow RSA-MD5 server certificate\n");
+#if __linux__
 	fprintf(stderr, "\t -a \tCA file used to verify server certificate\n\t\t(default: %s)\n", CERT_STORE);
+#else
+	fprintf(stderr, "\t -a \tCA file used to verify server certificate\n");
+#endif
 	fprintf(stderr, "\t -c \tuse console for standard input/output/error\n\t\t(default: %s)\n", CONSOLE);
 	fprintf(stderr, "\t -d \tdebug level (default 0)\n");
 	fprintf(stderr, "\t -D \tenable direct_io mode\n");
@@ -2759,12 +2784,12 @@ static ssize_t get_data(struct_url *url, off_t start, size_t size, char *destina
 		return -1;
 	}
 
-	trace("content_length %ld bytes %ld size %ld sid=%s\n", content_length,
+	trace("content_length %ld bytes %ld size %ld sid=%s\n", (long) content_length,
 	    bytes, size, url->sid);
 	if (content_length != size) {
 		size = min((size_t)content_length, size);
 		end = start + (off_t)size - 1;
-		trace("didn't yield the whole piece, new size %ld end %ld\n", size, end);
+		trace("didn't yield the whole piece, new size %ld end %ld\n", size, (long) end);
 	}
 
 
@@ -2901,7 +2926,7 @@ static ssize_t list_data(struct_url *url, off_t off, size_t size,
 	}
 
 	trace("hdr_len=%ld content_len=%ld off=%ld size=%ld bytes=%ld\n",
-	    header_length, content_length, off, size, bytes);
+	    header_length, (long) content_length, (long) off, size, bytes);
 	if (content_length != size) {
 		size = min((size_t)content_length, size);
 	}
