@@ -1,10 +1,24 @@
 #
+# Determine the platform first
+UNAME := $(shell uname -s)
+
+#
 # Activate by exporing this env variable:
 #
 # export ASAN_OPTIONS=symbolize=1:abort_on_error=1:disable_core=1:alloc_dealloc_mismatch=0:detect_leaks=1
 #
 ASAN_CPPFLAGS=-fsanitize=address -fno-omit-frame-pointer -fno-common
 ASAN_LDFLAGS=-fsanitize=address -fno-omit-frame-pointer -fno-common -lasan
+
+ifeq ($(UNAME), Darwin)
+
+MAIN_CFLAGS :=  -g -Os -Wall -D_FILE_OFFSET_BITS=64 $(ASAN_CPPFLAGS)
+CC = gcc
+CFLAGS += -I/usr/local/opt/openssl/include
+LDFLAGS = -lgnutls -lfuse 
+
+else
+
 MAIN_CFLAGS :=  -g -Os -Wall $(shell pkg-config fuse --cflags) $(ASAN_CPPFLAGS)
 MAIN_CPPFLAGS := -Wall -Wno-unused-function -Wconversion -Wtype-limits -DUSE_AUTH -D_XOPEN_SOURCE=700 -D_ISOC99_SOURCE $(ASAN_LDFLAGS)
 THR_LDFLAGS := -lpthread
@@ -18,6 +32,8 @@ ifeq ($(shell pkg-config --atleast-version $(GNUTLS_VERSION) gnutls ; echo $$?),
     LDFLAGS := $(shell pkg-config gnutls --libs)
 else
         $(info GNUTLS version at least $(GNUTLS_VERSION) required for SSL support.)
+endif
+
 endif
 
 binbase = edgefs
@@ -43,6 +59,10 @@ clean:
 
 %.1: %.1.txt
 	a2x -f manpage $<
+
+
+
+ifeq ($(UNAME), Linux)
 
 # Rules to automatically make a Debian package
 
@@ -82,4 +102,6 @@ $(pkg_deb_dir)/$(tar_gz): $(pkg_deb_dir)
 
 $(orig_tar_gz): $(pkg_deb_dir)/$(tar_gz)
 	ln -s $(tar_gz) $(orig_tar_gz)
+
+endif
 
