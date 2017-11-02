@@ -1053,12 +1053,13 @@ static void edgefs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
     off_t off, struct fuse_file_info *fi)
 {
 	(void) fi;
-
-	trace("read ino=%ld\n", ino);
-	struct_url *url = (struct_url *)fi->fh;
 	ssize_t res;
 
-	if (url->file_size <= off) {
+	struct_url *url = (struct_url *)fi->fh;
+
+	trace("read ino=%ld file_size=%ld off=%ld\n", ino, url->file_size, off);
+
+	if (url->file_size < off) {
 		/* Handling of EOF is not well documented, returning EOF as error
 		 * does not work but this does.  */
 		fuse_reply_buf(req, NULL,  0);
@@ -1181,9 +1182,20 @@ static void edgefs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 	}
 
 	if (to_set & FUSE_SET_ATTR_SIZE) {
-		if (edgefs_trunc(ino, attr->st_size) < 0)
+
+		/* libccow not yet support shrinking case well */
+		if (attr->st_size < stbuf.st_size) {
+			fuse_reply_err(req, ENOTSUP);
+			return;
+		}
+
+		if (edgefs_trunc(ino, attr->st_size) < 0) {
 			fuse_reply_err(req, EIO);
-		stbuf.st_size = attr->st_size;
+			return;
+		}
+
+		struct_url *url = (struct_url *)fi->fh;
+		url->file_size = INODE_TO_URL(ino)->file_size = stbuf.st_size = attr->st_size;
 	}
 
 	fuse_reply_attr(req, &stbuf, 1.0);
