@@ -59,7 +59,7 @@ edgefs%.1: edgefs.1
 
 clean:
 	rm -f $(targets) $(intermediates)
-	rm -rf ./$(pkg_dir)
+	rm -rf ./$(pkg_dir) ./BUILD ./BUILDROOT ./RPMS ./SOURCES ./SPECS ./SRPMS
 
 %.1: %.1.txt
 	a2x -f manpage $<

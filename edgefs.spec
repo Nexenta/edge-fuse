@@ -13,7 +13,7 @@ Requires:       fuse-libs >= 2.8.4
 Requires:	gnutls >= 3.3
 
 BuildRequires:  fuse-devel, gnutls-devel
-BuildRequires:	gcc
+BuildRequires:	gcc, asciidoc
 
 %description
 edgefs is a FUSE based filesystem for mounting http or https URLS as files in
@@ -32,14 +32,16 @@ make %{?_smp_mflags} all
 
 
 %install
-#make install DESTDIR=%{buildroot}
-cp -p %{SOURCE1} passwd-s3fs
+mkdir -p %{buildroot}%{_bindir}
+mkdir -p %{buildroot}%{_mandir}/man1
+cp edgefs %{buildroot}%{_bindir}/
+cp edgefs.1 %{buildroot}%{_mandir}/man1/
 
 
 %files
-%{_bindir}/s3fs
-%{_mandir}/man1/s3fs.1*
-%doc AUTHORS README.md ChangeLog COPYING passwd-s3fs
+%{_bindir}/edgefs
+%{_mandir}/man1/edgefs.1*
+%doc README.md
 
 
 %changelog
