@@ -1,6 +1,7 @@
 #
 # Determine the platform first
 UNAME := $(shell uname -s)
+DISTID := $(shell echo $$(. /etc/os-release; echo $$ID | tr '[A-Z]' '[a-z]'))
 
 #
 # Activate ASAN by exporing this env variable:
@@ -14,14 +15,14 @@ ASAN_LDFLAGS=
 
 ifeq ($(UNAME), Darwin)
 
-MAIN_CFLAGS :=  -g -O2 -Wall -D_FILE_OFFSET_BITS=64 $(ASAN_CPPFLAGS)
+MAIN_CFLAGS :=  -g -O2 -Wall -std=c99 -D_FILE_OFFSET_BITS=64 $(ASAN_CPPFLAGS)
 CC = gcc
 CFLAGS += -I/usr/local/opt/openssl/include
 LDFLAGS = -lgnutls -lfuse 
 
 else
 
-MAIN_CFLAGS :=  -g -O2 -Wall $(shell pkg-config fuse --cflags) $(ASAN_CPPFLAGS)
+MAIN_CFLAGS :=  -g -O2 -Wall -std=c99 $(shell pkg-config fuse --cflags) $(ASAN_CPPFLAGS)
 MAIN_CPPFLAGS := -Wall -Wno-unused-function -Wconversion -Wtype-limits -DUSE_AUTH -D_XOPEN_SOURCE=700 -D_ISOC99_SOURCE $(ASAN_LDFLAGS)
 THR_LDFLAGS := -lpthread
 GNUTLS_VERSION := 2.10
@@ -58,31 +59,31 @@ edgefs%.1: edgefs.1
 
 clean:
 	rm -f $(targets) $(intermediates)
-	rm -rf ./$(pkg_deb_dir)
+	rm -rf ./$(pkg_dir)
 
 %.1: %.1.txt
 	a2x -f manpage $<
 
-ifeq ($(UNAME), Linux)
+ifeq ($(DISTID), ubuntu)
 
 # Rules to automatically make a Debian package
 
+pkg_dir = pkgdeb
 package = $(shell dpkg-parsechangelog | grep ^Source: | sed -e s,'^Source: ',,)
 version = $(shell dpkg-parsechangelog | grep ^Version: | sed -e s,'^Version: ',, -e 's,-.*,,')
 revision = $(shell dpkg-parsechangelog | grep ^Version: | sed -e -e 's,.*-,,')
 architecture = $(shell dpkg --print-architecture)
 tar_dir = $(package)-$(version)
 tar_gz   = $(tar_dir).tar.gz
-pkg_deb_dir = pkgdeb
-unpack_dir  = $(pkg_deb_dir)/$(tar_dir)
-orig_tar_gz = $(pkg_deb_dir)/$(package)_$(version).orig.tar.gz
-pkg_deb_src = $(pkg_deb_dir)/$(package)_$(version)-$(revision)_source.changes
-pkg_deb_bin = $(pkg_deb_dir)/$(package)_$(version)-$(revision)_$(architecture).changes
+unpack_dir  = $(pkg_dir)/$(tar_dir)
+orig_tar_gz = $(pkg_dir)/$(package)_$(version).orig.tar.gz
+pkg_deb_src = $(pkg_dir)/$(package)_$(version)-$(revision)_source.changes
+pkg_deb_bin = $(pkg_dir)/$(package)_$(version)-$(revision)_$(architecture).changes
 
 deb_pkg_key = CB8C5858
 
 debclean:
-	rm -rf $(pkg_deb_dir)
+	rm -rf $(pkg_dir)
 
 deb: debsrc debbin
 
@@ -93,15 +94,36 @@ debsrc: $(unpack_dir)
 	cd $(unpack_dir) && dpkg-buildpackage -S -k$(deb_pkg_key)
 
 $(unpack_dir): $(orig_tar_gz)
-	tar -zxf $(orig_tar_gz) -C $(pkg_deb_dir)
+	tar -zxf $(orig_tar_gz) -C $(pkg_dir)
 
-$(pkg_deb_dir):
-	mkdir $(pkg_deb_dir)
+$(pkg_dir):
+	mkdir $(pkg_dir)
 
-$(pkg_deb_dir)/$(tar_gz): $(pkg_deb_dir)
-	git archive --format=tar.gz --prefix=$(package)-$(version)/ -o $(pkg_deb_dir)/$(tar_gz) HEAD
+$(pkg_dir)/$(tar_gz): $(pkg_dir)
+	git archive --format=tar.gz --prefix=$(package)-$(version)/ -o $(pkg_dir)/$(tar_gz) HEAD
 
-$(orig_tar_gz): $(pkg_deb_dir)/$(tar_gz)
+$(orig_tar_gz): $(pkg_dir)/$(tar_gz)
 	ln -s $(tar_gz) $(orig_tar_gz)
+
+else
+
+pkg_dir = SOURCES
+package = $(binbase)
+version = $(shell cat edgefs.spec |awk '/Version:/{print $$2}')
+tar_gz = $(package)-$(version).tar.gz
+
+rpm: rpmbin
+
+rpmbin: $(unpack_dir)
+	rpmbuild --quiet --define "_topdir `pwd`" -ba 'edgefs.spec'
+
+$(unpack_dir): $(pkg_dir)/$(tar_gz)
+	tar -zxf $(orig_tar_gz) -C $(pkg_dir)
+
+$(pkg_dir):
+	mkdir $(pkg_dir)
+
+$(pkg_dir)/$(tar_gz): $(pkg_dir)
+	git archive --format=tar.gz --prefix=$(package)-$(version)/ -o $(pkg_dir)/$(tar_gz) HEAD
 
 endif
