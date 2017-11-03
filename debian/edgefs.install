@@ -1,2 +1,2 @@
 #!/usr/bin/dh-exec
-edgefs-mt => /usr/bin/edgefs
+edgefs => /usr/bin/edgefs

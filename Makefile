@@ -3,23 +3,25 @@
 UNAME := $(shell uname -s)
 
 #
-# Activate by exporing this env variable:
+# Activate ASAN by exporing this env variable:
 #
 # export ASAN_OPTIONS=symbolize=1:abort_on_error=1:disable_core=1:alloc_dealloc_mismatch=0:detect_leaks=1
 #
-ASAN_CPPFLAGS=-fsanitize=address -fno-omit-frame-pointer -fno-common
-ASAN_LDFLAGS=-fsanitize=address -fno-omit-frame-pointer -fno-common -lasan
+#ASAN_CPPFLAGS=-fsanitize=address -fno-omit-frame-pointer -fno-common
+#ASAN_LDFLAGS=-fsanitize=address -fno-omit-frame-pointer -fno-common -lasan
+ASAN_CPPFLAGS=
+ASAN_LDFLAGS=
 
 ifeq ($(UNAME), Darwin)
 
-MAIN_CFLAGS :=  -g -Os -Wall -D_FILE_OFFSET_BITS=64 $(ASAN_CPPFLAGS)
+MAIN_CFLAGS :=  -g -O2 -Wall -D_FILE_OFFSET_BITS=64 $(ASAN_CPPFLAGS)
 CC = gcc
 CFLAGS += -I/usr/local/opt/openssl/include
 LDFLAGS = -lgnutls -lfuse 
 
 else
 
-MAIN_CFLAGS :=  -g -Os -Wall $(shell pkg-config fuse --cflags) $(ASAN_CPPFLAGS)
+MAIN_CFLAGS :=  -g -O2 -Wall $(shell pkg-config fuse --cflags) $(ASAN_CPPFLAGS)
 MAIN_CPPFLAGS := -Wall -Wno-unused-function -Wconversion -Wtype-limits -DUSE_AUTH -D_XOPEN_SOURCE=700 -D_ISOC99_SOURCE $(ASAN_LDFLAGS)
 THR_LDFLAGS := -lpthread
 GNUTLS_VERSION := 2.10
@@ -56,11 +58,10 @@ edgefs%.1: edgefs.1
 
 clean:
 	rm -f $(targets) $(intermediates)
+	rm -rf ./$(pkg_deb_dir)
 
 %.1: %.1.txt
 	a2x -f manpage $<
-
-
 
 ifeq ($(UNAME), Linux)
 
@@ -98,10 +99,9 @@ $(pkg_deb_dir):
 	mkdir $(pkg_deb_dir)
 
 $(pkg_deb_dir)/$(tar_gz): $(pkg_deb_dir)
-	git archive --format=tar.gz --prefix=$(package)-$(version) -o $(pkg_deb_dir)/$(tar_gz) HEAD
+	git archive --format=tar.gz --prefix=$(package)-$(version)/ -o $(pkg_deb_dir)/$(tar_gz) HEAD
 
 $(orig_tar_gz): $(pkg_deb_dir)/$(tar_gz)
 	ln -s $(tar_gz) $(orig_tar_gz)
 
 endif
-

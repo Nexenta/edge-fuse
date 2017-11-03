@@ -38,9 +38,33 @@ OPTIONS
 *-t 'timeout'*::
     Use different timeout for connections. Default '30's.
 
+*-d 'debug'*::
+    Set debug level (default 0).
+
+*-D 'direct'*::
+    Enable FUSE direct_io mode
+
+*-b 'chunksize'*::
+    Setup CCOW chunk size in bytes for newly created files (default 131072,
+    power of 2. Range: 4096 - 4194304).  Use this parameter to set most
+    optimal I/O alignment with an application.
+
+*-o 'order'*::
+    Setup CCOW btree order for newly created files (default 256. Range 32-640).
+
+*-R 'sockrecv'*::
+    Override socket receive buffer size
+
+*-S 'socksend'*::
+    Override socket send buffer size
+
+Example of running in foreground with debug on:
+
+edgefs -d 1 -f -c - http://user:password@server.com/MySharedBucket /mnt/MySharedBucket -d
+
 SSL OPTIONS
 ~~~~~~~~~~~
-Available when SSL support is compiled in.
+For usage with HTTPS protocol URLs.
 
 *-2*::
     Allow server certificates signed with RSA-MD2 (strongly discouraged)
@@ -62,7 +86,8 @@ authentication username and password. Currently special characters like
 whitespace are not handled so the URL cannot contain them.  See a sample URL
 below:
 
-      http://user:password@server.com/dir/file
+      http://user:password@server.com/MySharedBucket
+      https://user:password@server.com/MySharedBucket
 
 *'FUSE-OPTIONS'*
 ~~~~~~~~~~~~~~~~
@@ -90,7 +115,7 @@ AUTHORS
  Miklos Szeredi <miklos@szeredi.hu>
  hmb  marionraven at users.sourceforge.net
  Michal Suchanek <hramrach@centrum.cz>
- Nexenta Systems, Inc
+ Dmitry Yusupov <dmitry.yusupov@nexenta.com> - Nexenta Systems, Inc
 
 
 COPYING
