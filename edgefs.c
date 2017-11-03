@@ -2969,7 +2969,7 @@ static ssize_t list_data(struct_url *url, off_t off, size_t size,
 	bytes = content_length;
 
 	size_t thisoff, nextoff=0, lenentry;
-	char *saveptr;
+	char *saveptr = NULL;
 	char *line = strtok_r(url->req_buf, "\n", &saveptr);
 	while (line && (line - url->req_buf) < content_length) {
 

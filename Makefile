@@ -114,11 +114,8 @@ tar_gz = $(package)-$(version).tar.gz
 
 rpm: rpmbin
 
-rpmbin: $(unpack_dir)
+rpmbin: $(pkg_dir)/$(tar_gz)
 	rpmbuild --quiet --define "_topdir `pwd`" -ba 'edgefs.spec'
-
-$(unpack_dir): $(pkg_dir)/$(tar_gz)
-	tar -zxf $(orig_tar_gz) -C $(pkg_dir)
 
 $(pkg_dir):
 	mkdir $(pkg_dir)
