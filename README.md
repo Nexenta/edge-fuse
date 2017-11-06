@@ -118,7 +118,7 @@ While mounted, objects remain versioned, searchable and globally accessible (mul
 ```
 
 At this point EdgeFS module emulates POSIX access to S3 bucket and would use Extended Edge API to enable high performance R/W access at /mnt/bk1 mount point. At the moment, we only emulate flat bucket operations.
-Learn more about [Edge-X S3 API here](https://https://edgex.docs.apiary.io).
+Learn more about [Edge-X S3 API here](https://edgex.docs.apiary.io).
 
 
 Ask immediate question on [NexentaEdge Developers Channel](https://nexentaedge.slack.com/messages/general/)
