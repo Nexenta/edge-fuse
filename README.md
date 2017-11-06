@@ -2,6 +2,13 @@
 
 High-Performance FUSE library for Edge-X S3 API.
 
+Tested and supported platforms:
+
+- Linux x86 64-bit
+- Mac OSX x86 64-bit
+- Linux ARM 64-bit, mobile platforms (coming soon)
+- Windows x86 64-bit (coming soon)
+
 NexentaEdge Extended S3 API provides unique benefits which can be useful for Machine Deep Learning, Big Data and IoT frameworks:
 
 * Mount S3 objects for fast File/POSIX access avoid unnecessary copy, fetch only needed datasets
