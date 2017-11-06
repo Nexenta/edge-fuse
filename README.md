@@ -50,36 +50,36 @@ Follow up with our Community! Please join us at the [NexentaEdge Devops communit
 The following are the steps to initialize, setup region namespace, tenant, service:
     
 ```console
-    # setup alias for easy CLI style management
-    alias neadm="docker exec -it s3data neadm"
+# setup alias for easy CLI style management
+alias neadm="docker exec -it s3data neadm"
     
-    # verify that service is running
-    neadm system status
+# verify that service is running
+neadm system status
     
-    # initialize and setup devops license
-    neadm system init
-    neadm system license set online ACTIVATION_KEY
+# initialize and setup devops license
+neadm system init
+neadm system license set online ACTIVATION_KEY
     
-    # setup simple Edge-X S3 service
-    neadm cluster create region1
-    neadm tenant create region1/tenant1
-    neadm bucket create region1/tenant1/bk1
-    neadm service create s3 s3svc
-    neadm service serve s3svc region1/tenant1
-    neadm service add s3svc SERVERID  # use neadm system status to find out 
-    neadm service restart s3svc
-    neadm service show s3svc
+# setup simple Edge-X S3 service
+neadm cluster create region1
+neadm tenant create region1/tenant1
+neadm bucket create region1/tenant1/bk1
+neadm service create s3 s3svc
+neadm service serve s3svc region1/tenant1
+neadm service add s3svc SERVERID  # use neadm system status to find out 
+neadm service restart s3svc
+neadm service show s3svc
     
-    # assuming that default Docker bridge address asigned to container
-    # is 172.17.0.3 verify that Edge-X S3 port is listening
-    curl http://172.17.0.3:9982
+# assuming that default Docker bridge address asigned to container
+# is 172.17.0.3 verify that Edge-X S3 port is listening
+curl http://172.17.0.3:9982
 ```
 
 Setup GUI for easy on-going management and monitoring:
 
 ```console
-    docker run -e API_ENDPOINT=http://172.17.0.3:8080 -p 3000:3000 \
-        nexenta/nedgeui:2.1.0
+docker run -e API_ENDPOINT=http://172.17.0.3:8080 -p 3000:3000 \
+    nexenta/nedgeui:2.1.0
 ```
 
 * Point browser to the host's port 3000
@@ -95,31 +95,30 @@ While mounted, objects remain versioned, searchable and globally accessible (mul
 ## Compile edgefs binary
 
 ```console
-    make all
+make all
 ```
 
 ## Build Debian package
 
 ```console
-    make deb
+make deb
 ```
 
 ## Build RPM package
 
 ```console
-    make rpm
+make rpm
 ```
 
 ## Install package or binary and mount bucket
 
 ```console
-    mkdir /mnt/bk1
-    edgefs -c - -f http://172.17.0.3:9982/bk1 /mnt/bk1
+mkdir /mnt/bk1
+edgefs -c - -f http://172.17.0.3:9982/bk1 /mnt/bk1
 ```
 
 At this point EdgeFS module emulates POSIX access to S3 bucket and would use Extended Edge API to enable high performance R/W access at /mnt/bk1 mount point. At the moment, we only emulate flat bucket operations.
 Learn more about [Edge-X S3 API here](https://edgex.docs.apiary.io).
-
 
 Ask immediate question on [NexentaEdge Developers Channel](https://nexentaedge.slack.com/messages/general/)
 
