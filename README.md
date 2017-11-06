@@ -66,7 +66,7 @@ neadm tenant create region1/tenant1
 neadm bucket create region1/tenant1/bk1
 neadm service create s3 s3svc
 neadm service serve s3svc region1/tenant1
-neadm service add s3svc SERVERID  # use neadm system status to find out 
+neadm service add s3svc SID  # use neadm system status to find out server id
 neadm service restart s3svc
 neadm service show s3svc
     
