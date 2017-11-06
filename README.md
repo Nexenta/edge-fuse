@@ -33,12 +33,12 @@ Comparision to existing cloud object storage APIs:
 Give Edge-X S3 a try in easy to run single command installation:
 
 ```console
-    # location where to keep blobs
-    mkdir /var/tmp/data
+# location where to keep blobs
+mkdir /var/tmp/data
     
-    # start nexenta/nedge daemon and Edge-X S3 compatible service
-    docker run --name s3data -v /etc/localtime:/etc/localtime:ro -v /var/tmp/data:/data -d \
-            nexenta/nedge start -j ccowserv -j ccowgws3
+# start nexenta/nedge daemon and Edge-X S3 compatible service
+docker run --name s3data -v /etc/localtime:/etc/localtime:ro -v /var/tmp/data:/data -d \
+    nexenta/nedge start -j ccowserv -j ccowgws3
 
 ```
 
