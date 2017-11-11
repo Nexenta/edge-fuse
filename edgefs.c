@@ -973,7 +973,7 @@ static void edgefs_readdir(fuse_req_t req, fuse_ino_t dir_ino, size_t size,
 	struct dirbuf b;
 	ssize_t res;
 
-	trace("readdir ino=%ld\n", dir_ino);
+	trace("readdir ino=%ld size=%ld\n", dir_ino, size);
 	if (dir_ino != 1) {
 		fuse_reply_err(req, ENOTDIR);
 		return;
@@ -982,7 +982,7 @@ static void edgefs_readdir(fuse_req_t req, fuse_ino_t dir_ino, size_t size,
 	struct_url *url = create_url_copy(&main_url, NULL);
 
 	url->req_buf_size = size;
-	url->req_buf = malloc(size);
+	url->req_buf = calloc(size, sizeof(char));
 
 	memset(&b, 0, sizeof(b));
 	dirbuf_add(req, &b, ".", 1);
