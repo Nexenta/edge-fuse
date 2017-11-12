@@ -104,6 +104,7 @@ enum url_flags {
 
 #define ACCESS_KEY_LEN 24
 #define SECRET_KEY_LEN 48
+#define DATE_TIME_LEN 32
 
 typedef struct access_keys_ {
 	char access[ACCESS_KEY_LEN];
@@ -116,7 +117,9 @@ typedef struct url {
 	char *url;
 	char *host; /*hostname*/
 	int port;
-	char *path; /*get path*/
+	char *fullpath; /*full canonical path*/
+	char *querystring; /*full canonical path's querystring*/
+	char *path; /*base path*/
 	char *name; /*file name*/
 	access_keys_t *access_keys;
 	char *auth; /*encoded auth data*/
@@ -148,10 +151,13 @@ typedef struct url {
 	time_t last_modified;
 	char tname[TNAME_LEN + 1];
 	char *sid;
+	char *region;
 	pthread_mutex_t sid_mutex;
+	char date_time_stamp[DATE_TIME_LEN];
 } struct_url;
 
-static struct_url main_url;
+struct_url main_url;
+access_keys_t main_url_access_keys;
 static char* argv0;
 
 /* this only works on 64-bit platforms */
@@ -446,39 +452,68 @@ sha256_update(void *ctx, const void *m, unsigned long len)
 #define AWS_DATE_LABEL "x-amz-date"
 
 typedef struct {
+	const char * fullpath;
+	const char * querystring;
+	const char * host;
+	int port;
 	const char * method;
 	const char * aws_region;
-	const char * aws_endpt_prefix;
 	const char * aws_service;
-	const char * aws_shadow_id;
 	const char * aws_access_key;
 	const char * aws_secret_key;
-	const char * date_time_stamp;
+	const char date_time_stamp[DATE_TIME_LEN];
 	const char * payload;
+	size_t payload_len;
 } aws_signing_inputs;
 
 typedef struct {
 	char date_header[32];
 	char auth_header[256];
 	char aws_host[64];
-	char canonical_uri[64];
 } aws_signing_outputs;
 
-void init_inputs(aws_signing_inputs *input)
+static void initialize_inputs(aws_signing_inputs *input, const char * method,
+    struct_url *url, const char * payload, size_t payload_len)
 {
-	//set defaults:
-	input->method = "GET";
-	input->payload = NULL;
-	input->aws_region = "us-east-1";
+	input->method = method;
+	input->payload = payload;
+	input->payload_len = payload_len;
+	input->aws_region = NULL;
 	input->aws_service = "s3";
-	//clear mandatory params:
-	input->aws_endpt_prefix = NULL;
-	input->aws_shadow_id = NULL;
-	input->aws_access_key = NULL;
-	input->aws_secret_key = NULL;
-	input->date_time_stamp = NULL;
-	return;
+
+	if (url->access_keys) {
+		input->aws_access_key = &url->access_keys->access[0];
+		input->aws_secret_key = &url->access_keys->secret[0];
+	} else {
+		input->aws_access_key = NULL;
+		input->aws_secret_key = NULL;
+	}
+
+	char date_time_stamp[DATE_TIME_LEN];
+	time_t sig_time = time(0);
+	struct tm  *tstruct = gmtime(&sig_time);
+	strftime(date_time_stamp, sizeof(date_time_stamp), "%Y%m%dT%H%M%SZ", tstruct);
+
+	memset((void *) &input->date_time_stamp[0], 0, DATE_TIME_LEN);
+	strncpy((char *) &input->date_time_stamp[0],date_time_stamp, strlen(date_time_stamp));
+
+	if (url->fullpath)
+		input->fullpath = url->fullpath;
+	else
+		input->fullpath = NULL;
+	if (url->querystring)
+		input->querystring = url->querystring;
+	else
+		input->querystring = NULL;
+
+	input->host = url->host;
+	input->port = url->port;
+	if (url->region)
+		input->aws_region = url->region;
 }
+
+
+
 
 void hmac_gen( const uint8_t * const input_key, const uint8_t key_length,
     uint8_t * const msg, uint8_t hmac_out[SHA256_DIGEST_LENGTH])
@@ -520,30 +555,27 @@ void hmac_gen( const uint8_t * const input_key, const uint8_t key_length,
 #endif
 }
 
-void hash_sha256_hex_gen (const char * const input, char * hex_out)
+static void hash_sha256_hex_gen (const char * const input, size_t input_len,
+    char * hex_out)
 {
 	uint8_t digest[SHA256_DIGEST_LENGTH];
 	struct sha256 digest_s;
 	sha256_init( &digest_s );
 	if (input != NULL)
-		sha256_update( &digest_s, (uint8_t *)input, strlen(input) );
+		sha256_update( &digest_s, (uint8_t *)input, input_len );
 	sha256_sum( &digest_s, digest );
 	hex_out[0] = '\0';
 	for( size_t i = 0; i < SHA256_DIGEST_LENGTH; i++ )
 		sprintf(hex_out, "%s%02x", hex_out, digest[ i ] );
 }
 
-int generate_aignature(aws_signing_inputs *in, aws_signing_outputs *out) {
+static int generate_aignature(aws_signing_inputs *in, aws_signing_outputs *out) {
 
-	if (in->aws_endpt_prefix == NULL)
-		return -1;
-	if (in->aws_shadow_id == NULL)
-		return -2;
 	if (in->aws_access_key == NULL)
 		return -3;
 	if (in->aws_secret_key == NULL)
 		return -4;
-	if (in->date_time_stamp == NULL)
+	if (strlen(in->date_time_stamp) == 0)
 		return -5;
 
 	char datestamp[12];
@@ -551,29 +583,41 @@ int generate_aignature(aws_signing_inputs *in, aws_signing_outputs *out) {
 	strncpy(datestamp, in->date_time_stamp, 8);
 
 	// ************* TASK 1: CREATE A CANONICAL REQUEST *************
-	sprintf(out->canonical_uri, "/things/%s/shadow", in->aws_shadow_id);
+	sprintf(out->aws_host, "%s:%d", in->host, in->port);
 
-	sprintf(out->aws_host, "%s.iot.%s.amazonaws.com", in->aws_endpt_prefix, in->aws_region);
-
-	char canonical_headers[128];// = 'host:' + host + '\n' + 'x-amz-date:' + amzdate + '\n'
-	sprintf(canonical_headers, "host:%s\n%s:%s\n", out->aws_host, AWS_DATE_LABEL, in->date_time_stamp);
+	// = 'host:' + host + '\n' + 'x-amz-date:' + amzdate + '\n'
+	char canonical_headers[1024];
+	sprintf(canonical_headers, "host:%s\n%s:%s\n", out->aws_host,
+	    AWS_DATE_LABEL, in->date_time_stamp);
 
 	char hmac_payload_hex[ SHA256_DIGEST_HEX_LENGTH ];
-	hash_sha256_hex_gen(in->payload, hmac_payload_hex);
+	if (in->payload)
+		hash_sha256_hex_gen(in->payload, in->payload_len, hmac_payload_hex);
+	else
+		strcpy(hmac_payload_hex, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 
-	char canonical_request[256]; //= method + '\n' + canonical_uri + '\n' + canonical_querystring + '\n' + canonical_headers + '\n' + signed_headers + '\n' + payload_hmac
-	sprintf(canonical_request, "%s\n%s\n\n%s\n%s\n%s", in->method, out->canonical_uri, canonical_headers, AWS_SIGNED_HEADERS, hmac_payload_hex);
+	//= method + '\n' + canonical_uri + '\n' + canonical_querystring + '\n' +
+	//	canonical_headers + '\n' + signed_headers + '\n' + payload_hmac
+	char canonical_request[4096];
+	sprintf(canonical_request, "%s\n%s\n%s\n%s\n%s\n%s", in->method,
+	    (in->fullpath ? in->fullpath : ""), (in->querystring ? in->querystring : ""),
+	    canonical_headers, AWS_SIGNED_HEADERS, hmac_payload_hex);
 
 	char hmac_canonical_request_hex[SHA256_DIGEST_HEX_LENGTH];
-	hash_sha256_hex_gen(canonical_request, hmac_canonical_request_hex);
+	hash_sha256_hex_gen(canonical_request, strlen(canonical_request),
+	    hmac_canonical_request_hex);
 
 
 	//# ************* TASK 2: CREATE THE STRING TO SIGN *************
 	char credential_scope[64];
-	sprintf(credential_scope, "%s/%s/%s/%s", datestamp, in->aws_region, in->aws_service, AWS_REQUEST_TYPE);
+	sprintf(credential_scope, "%s/%s/%s/%s", datestamp, in->aws_region,
+	    in->aws_service, AWS_REQUEST_TYPE);
 
-	char string_to_sign[256]; //= algorithm + '\n' +  amzdate + '\n' +  credential_scope + '\n' +  hashlib.sha256(canonical_request).hexdigest()
-	sprintf(string_to_sign, "%s\n%s\n%s\n%s", AWS_ALGORITHM, in->date_time_stamp, credential_scope, hmac_canonical_request_hex);
+	//= algorithm + '\n' +  amzdate + '\n' +  credential_scope + '\n' +
+	//	hashlib.sha256(canonical_request).hexdigest()
+	char string_to_sign[4096 + 256];
+	sprintf(string_to_sign, "%s\n%s\n%s\n%s", AWS_ALGORITHM, in->date_time_stamp,
+	    credential_scope, hmac_canonical_request_hex);
 
 
 	//# ************* TASK 3: CALCULATE THE SIGNATURE *************
@@ -598,11 +642,11 @@ int generate_aignature(aws_signing_inputs *in, aws_signing_outputs *out) {
 		sprintf(hmac_signature_hex, "%s%02x", hmac_signature_hex, hmac_signature[ i ] );
 
 	//# ************* TASK 4: ADD SIGNING INFORMATION TO THE REQUEST [headers] *************
-	sprintf(out->auth_header, "Authorization: %s Credential=%s/%s, SignedHeaders=%s, Signature=%s", AWS_ALGORITHM, in->aws_access_key, credential_scope, AWS_SIGNED_HEADERS, hmac_signature_hex);
+	sprintf(out->auth_header, "Authorization: %s Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+	    AWS_ALGORITHM, in->aws_access_key, credential_scope, AWS_SIGNED_HEADERS, hmac_signature_hex);
 
 	sprintf(out->date_header, "%s: %s", AWS_DATE_LABEL, in->date_time_stamp);
 
-	trace("canonical_headers length: %03d  value: %s\n", (int) strlen(canonical_headers), canonical_headers);
 	trace("canonical_request length: %03d  value: %s\n", (int) strlen(canonical_request), canonical_request);
 	trace("canonical_request hmac hex: %s\n", hmac_canonical_request_hex);
 	trace("credential_scope length: %03d  value: %s\n", (int) strlen(credential_scope), credential_scope);
@@ -836,6 +880,8 @@ static struct_url * create_url_copy(const struct_url * url, char *newname)
 		res->sid = strdup(url->sid);
 	if (url->auth)
 		res->auth = strdup(url->auth);
+	if (url->access_keys)
+		memcpy(&res->access_keys, &url->access_keys, sizeof(access_keys_t));
 	memset(res->tname, 0, TNAME_LEN + 1);
 	snprintf(res->tname, TNAME_LEN, "%0*lX", TNAME_LEN, (long ) pthread_self());
 	pthread_mutex_init((pthread_mutex_t *)&url->sid_mutex, NULL);
@@ -1057,7 +1103,7 @@ static void edgefs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 
 	struct_url *url = (struct_url *)fi->fh;
 
-	trace("read ino=%ld file_size=%ld off=%ld\n", ino, url->file_size, off);
+	trace("read ino=%ld file_size=%ld off=%ld\n", ino, (long) url->file_size, (long) off);
 
 	if (url->file_size < off) {
 		/* Handling of EOF is not well documented, returning EOF as error
@@ -1605,6 +1651,7 @@ static int init_url(struct_url* url)
 #if __linux__
 	url->cafile = CERT_STORE;
 #endif
+	url->region = "us-west-1";
 	return 0;
 }
 
@@ -1625,8 +1672,6 @@ static int free_url(struct_url* url)
 	url->req_buf_size = 0;
 	if (url->auth) free(url->auth);
 	url->auth = 0;
-	if (url->access_keys)
-		free(url->access_keys);
 	pthread_mutex_destroy(&url->sid_mutex);
 	url->port = 0;
 	url->proto = 0; /* only after socket closed */
@@ -1794,6 +1839,8 @@ static void usage(void)
 	fprintf(stderr, "\t -S \toverride socket send buffer size\n");
 	fprintf(stderr, "\t -r \tnumber of times to retry connection on reset (default: %i)\n", RESET_RETRIES);
 	fprintf(stderr, "\t -t \tset socket timeout in seconds (default: %i)\n", TIMEOUT);
+	fprintf(stderr, "\t -k \tset the ACCESS:SECRET for authentication\n");
+	fprintf(stderr, "\t -T \tset the region (default: us-west-1\n");
 	fprintf(stderr, "\tmount-parameters should include the mount point and FUSE -o parameters\n");
 }
 
@@ -1831,11 +1878,7 @@ retrieve_access_key(struct_url *main_url, char **argv)
 	}
 	aPtr++;
 	size_t len = (size_t) (aPtr - keys);
-	if (main_url->access_keys == NULL) {
-		main_url->access_keys = calloc(1, sizeof(access_keys_t));
-		if (!main_url->access_keys)
-			return -ENOMEM;
-	}
+	main_url->access_keys = &main_url_access_keys;
 	memcpy(&main_url->access_keys->access, keys, len - 1 );
 	main_url->access_keys->access[len] = '\0';
 	memcpy(&main_url->access_keys->secret, aPtr, total_len - len);
@@ -1843,6 +1886,21 @@ retrieve_access_key(struct_url *main_url, char **argv)
 
 	return 0;
 }
+
+int
+retrieve_region(struct_url *main_url, char **argv)
+{
+	int err = 0;
+	if ( (!main_url) || (!argv[1]) )
+		return -EFAULT;
+
+	char *region = argv[1];
+	if (region) {
+		main_url->region = region;
+	}
+	return err;
+}
+
 
 int main(int argc, char *argv[])
 {
@@ -1910,6 +1968,14 @@ int main(int argc, char *argv[])
 				  }
 				  shift;
 				  break;
+			case 'T':
+				  err = retrieve_region(&main_url, argv);
+				  if (err) {
+					fprintf(stderr, "Unable to retrieve Region : %d\n", err);
+					return 4;
+				  }
+				  shift;
+				  break;
 			case 'f': do_fork = 0;
 				  break;
 			default:
@@ -1965,8 +2031,10 @@ int main(int argc, char *argv[])
 
 	if (fuse_parse_cmdline(&args, &mountpoint, NULL, NULL) != -1 &&
 	    !fuse_opt_add_arg(&args, "-odefault_permissions") &&
+#if !__APPLE__
 	    !fuse_opt_add_arg(&args, "-obig_writes") &&
 	    !fuse_opt_add_arg(&args, "-oatomic_o_trunc") &&
+#endif
 	    (ch = fuse_mount(mountpoint, &args)) != NULL) {
 
 		/* try to fork at some point where the setup is mostly done */
@@ -2549,8 +2617,13 @@ parse_header(struct_url *url, const char *buf, size_t bytes,
 		}
 		if (mempref(ptr, date, (size_t)(end - ptr), 0)) {
 			memset(&tm, 0, sizeof(tm));
+#if __APPLE__
+			if (!strptime(ptr + strlen(date),
+				    "%a, %d %b %Y %H:%M:%S %Z", &tm)) {
+#else
 			if (!strptime(ptr + strlen(date),
 				    "%n%a, %d %b %Y %T %Z", &tm)) {
+#endif
 				http_report("invalid time",
 				    method, ptr + strlen(date),
 				    (size_t)(end - ptr) - strlen(date)) ;
@@ -2586,8 +2659,9 @@ exchange(struct_url *url, char *buf, const char *method,
 	int is_del = strcmp(method, "DELETE") == 0;
 	int is_head = strcmp(method, "HEAD") == 0;
 	int is_finalize;
-	intmax_t len = range ? ((intmax_t)end - (intmax_t)start + 1) : 0;
+	size_t len = range ? ((size_t)end - (size_t)start + 1) : 0;
 	char fullpath[2048];
+	char querystring[256];
 
 req:
 
@@ -2602,13 +2676,19 @@ req:
 	}
 
 	/* Build request buffer, starting with the request method. */
-
-	if (comp)
-		bytes = (size_t)snprintf(buf, HEADER_SIZE, "%s %s?comp=%s%s HTTP/1.1\r\nHost: %s:%d\r\n",
-		    method, fullpath, comp, (is_finalize ? "&finalize" : ""), url->host, url->port);
-	else
+	querystring[0] = 0;
+	if (comp) {
+		strcat(querystring, "comp=");
+		strcat(querystring, comp);
+		strcat(querystring, is_finalize ? "&finalize=" : "");
+		bytes = (size_t)snprintf(buf, HEADER_SIZE, "%s %s?%s HTTP/1.1\r\nHost: %s:%d\r\n",
+		    method, fullpath, querystring, url->host, url->port);
+	} else
 		bytes = (size_t)snprintf(buf, HEADER_SIZE, "%s %s HTTP/1.1\r\nHost: %s:%d\r\n",
 		    method, fullpath, url->host, url->port);
+	url->fullpath = &fullpath[0];
+	url->querystring = &querystring[0];
+
 	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 	    "User-Agent: %s %s\r\n", __FILE__, VERSION);
 	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
@@ -2640,12 +2720,23 @@ req:
 	if (is_put) {
 		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 		    "%s\r\n", data);
+		len = strlen(data);
 	}
 	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 	    "Connection: keep-alive\r\n");
 	if (url->auth)
 		bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
 		    "Authorization: Basic %s\r\n", url->auth);
+	if (url->access_keys) {
+		aws_signing_inputs inputs;
+		initialize_inputs(&inputs, method, url, NULL, 0);
+		aws_signing_outputs outputs;
+		generate_aignature(&inputs, &outputs);
+		bytes += (size_t) snprintf(buf + bytes, HEADER_SIZE - bytes,
+		    "%s\r\n", outputs.auth_header);
+		bytes += (size_t) snprintf(buf + bytes, HEADER_SIZE - bytes,
+		    "%s\r\n", outputs.date_header);
+	}
 	bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes, "\r\n");
 
 	trace("=== HTTP HDR ctx=%p ===\r\n%s", url, buf);
