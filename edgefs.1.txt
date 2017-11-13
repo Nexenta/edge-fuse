@@ -89,6 +89,15 @@ below:
       http://user:password@server.com/MySharedBucket
       https://user:password@server.com/MySharedBucket
 
+V4 AUTH OPTIONS
+~~~~~~~~~~~~~~~
+
+*-k 'key_secret'*::
+    Enable AWS Signature v4 Authentication. Format: KEY:SECRET
+
+*-T 'region'*::
+    Use specific S3 region. The default is us-west-1
+
 *'FUSE-OPTIONS'*
 ~~~~~~~~~~~~~~~~
 These options are passed to the *FUSE* library. At the very least the mount point should be specified.
