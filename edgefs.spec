@@ -1,5 +1,5 @@
 Name:           edgefs
-Version:        1.0.0
+Version:        1.0.1
 Release:        1%{?dist}
 Summary:        FUSE-based file system backed by NexentaEdge Extended S3 API
 Group:          System Environment/Base
@@ -46,5 +46,5 @@ cp edgefs.1 %{buildroot}%{_mandir}/man1/
 
 %changelog
 
-* Fri Nov 10 2017 Dmitry Yusupov <dmitry.yusupov@nexenta.com> - 1.0.0-1
-- Initial build of 1.0.0 from https://github.com/Nexenta/edge-fuse
+* Fri Nov 10 2017 Dmitry Yusupov <dmitry.yusupov@nexenta.com> - 1.0.1-1
+- Initial build of 1.0.1 from https://github.com/Nexenta/edge-fuse

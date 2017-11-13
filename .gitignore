@@ -51,4 +51,5 @@ Module.symvers
 Mkfile.old
 dkms.conf
 edgefs
+edgefs.1
 fstest
