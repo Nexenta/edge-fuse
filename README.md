@@ -118,6 +118,16 @@ edgefs -c - -f http://172.17.0.3:9982/bk1 /mnt/bk1
 ```
 
 At this point EdgeFS module emulates POSIX access to S3 bucket and would use Extended Edge API to enable high performance R/W access at /mnt/bk1 mount point. At the moment, we only emulate flat bucket operations.
+
+## Regression tests
+
+Build fstest utility and execute TAP tests from the mount point, example:
+
+```console
+cd /mnt/bk1
+prove -r /path/to/edge-fuse/tests
+```
+
 Learn more about [Edge-X S3 API here](https://edgex.docs.apiary.io).
 
 Ask immediate question on [NexentaEdge Developers Channel](https://nexentaedge.slack.com/messages/general/)

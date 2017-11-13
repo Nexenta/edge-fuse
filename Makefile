@@ -64,6 +64,9 @@ clean:
 %.1: %.1.txt
 	a2x -f manpage $<
 
+fstest: fstest.c
+	$(CC) -Wall ${CFLAGS} fstest.c -o fstest
+
 ifeq ($(DISTID), ubuntu)
 
 # Rules to automatically make a Debian package
