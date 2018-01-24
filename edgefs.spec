@@ -1,5 +1,5 @@
 Name:           edgefs
-Version:        1.0.1
+Version:        1.1.0
 Release:        1%{?dist}
 Summary:        FUSE-based file system backed by NexentaEdge Extended S3 API
 Group:          System Environment/Base
@@ -33,18 +33,23 @@ make %{?_smp_mflags} all
 
 %install
 mkdir -p %{buildroot}%{_bindir}
+mkdir -p %{buildroot}%{_libdir}
 mkdir -p %{buildroot}%{_mandir}/man1
 cp edgefs %{buildroot}%{_bindir}/
+cp libcachemap.so.0.0 %{buildroot}%{_libdir}/libcachemap.so.0.0
 cp edgefs.1 %{buildroot}%{_mandir}/man1/
 
 
 %files
 %{_bindir}/edgefs
+%{_libdir}/libcachemap.so.0.0
 %{_mandir}/man1/edgefs.1*
 %doc README.md
 
 
 %changelog
+* Wed Jan 24 2018 Dmitry Yusupov <dmitry.yusupov@nexenta.com> - 1.1.0-1
+- Support for L2 extended cache on SSD/NVMe
 
 * Fri Nov 10 2017 Dmitry Yusupov <dmitry.yusupov@nexenta.com> - 1.0.1-1
 - Initial build of 1.0.1 from https://github.com/Nexenta/edge-fuse

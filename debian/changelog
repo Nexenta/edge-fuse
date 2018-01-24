@@ -1,3 +1,9 @@
+edgefs (1.1.0-1) testing; urgency=medium
+
+  * Support for L2 extended cache on SSD/NVMe
+
+ -- Nexenta Systems <support@nexenta.com>  Wed, 24 Oct 2018 17:16:08 +0200
+
 edgefs (1.0.1-1) testing; urgency=medium
 
   * Initial release

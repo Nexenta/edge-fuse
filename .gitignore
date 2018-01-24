@@ -53,3 +53,4 @@ dkms.conf
 edgefs
 edgefs.1
 fstest
+cachemap/cachemap_test

@@ -73,6 +73,8 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 
+#include "cachemap/cachemap.h"
+
 #define FUSE_LOOP fuse_session_loop_mt
 
 #include <gnutls/gnutls.h>
@@ -87,7 +89,7 @@
 #define MAX_REDIRECTS 32
 #define TNAME_LEN 13
 #define RESET_RETRIES 8
-#define VERSION "1.0.1 \"Edge-X API client\""
+#define VERSION "1.1.0 \"Edge-X API client\""
 #define BUCKET_MAX 1000000
 
 enum sock_state {
@@ -121,6 +123,7 @@ typedef struct url {
 	char *querystring; /*full canonical path's querystring*/
 	char *path; /*base path*/
 	char *name; /*file name*/
+	uint64_t bhid_small;
 	access_keys_t *access_keys;
 	char *auth; /*encoded auth data*/
 	long retry_reset; /*retry reset connections*/
@@ -158,7 +161,12 @@ typedef struct url {
 
 struct_url main_url;
 access_keys_t main_url_access_keys;
-static char* argv0;
+static char *argv0;
+static char *cachemapdir;
+static struct cachemap *cachemap_obj;
+static long cachemap_pshift = 12;
+static int cachemap_accel = 12;
+static long cachemap_size = 1024;
 
 /* this only works on 64-bit platforms */
 #define INODE_TO_URL(_ino) ((struct_url*)(_ino))
@@ -180,6 +188,29 @@ static int open_client_socket(struct_url *url);
 static int close_client_socket(struct_url *url);
 static int close_client_force(struct_url *url);
 static void destroy_url_copy(void *);
+
+static inline int
+cachemap_cache_check(uint64_t off, size_t size, uint64_t *page_size_out,
+    uint64_t *aligned_off_out)
+{
+	uint64_t page_size = 1ULL << cachemap_pshift;
+	uint64_t unaligned_start = off & (page_size - 1);
+	uint64_t unaligned_end = (off + size) & (page_size -1);
+
+	*page_size_out = page_size;
+	*aligned_off_out = (uint64_t)off - unaligned_start;
+	return (cachemap_obj && !unaligned_start && !unaligned_end);
+}
+
+static inline uint64_t
+cachemap_build_nhid(struct_url *url)
+{
+	uint64_t nhid_small;
+	FNV_hash(url->name, (int)strlen(url->name), &nhid_small);
+	nhid_small ^= url->bhid_small;
+	return nhid_small;
+}
+
 
 /* Protocol symbols. */
 #define PROTO_HTTP 0
@@ -1113,11 +1144,54 @@ static void edgefs_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 	}
 
 	url->need_finalize = 0;
+
 	char *out_buf = malloc(size);
+	uint64_t page_size;
+	uint64_t aligned_off;
+	int do_cache = cachemap_cache_check((uint64_t)off, size, &page_size,
+	    &aligned_off);
+
+	uint64_t nhid_small;
+
+	if (do_cache) {
+		nhid_small = cachemap_build_nhid(url);
+
+		trace("cachemap on read ino=%ld page_size=%ld aligned_off=%ld\n",
+		    ino, page_size, aligned_off);
+
+		uint64_t buf_off = 0;
+		for (uint64_t i = aligned_off; i < (uint64_t)off + size; i += page_size) {
+			trace("cache get nhid_small=%lx off=%lx size=%ld\n", nhid_small, i, page_size);
+			char *page = cachemap_get(cachemap_obj, i, nhid_small, 0);
+			if (!page)
+				goto _cache_miss;
+			memcpy(out_buf + buf_off, page, page_size);
+			buf_off += page_size;
+			free(page);
+		}
+
+		assert(size == buf_off);
+		fuse_reply_buf(req, out_buf, size);
+		free(out_buf);
+		return;
+	}
+
+_cache_miss:
+
+	trace("miss on off=%lx size=%ld\n", off, size);
+
 	if ((res = get_data(url, off, size, out_buf)) < 0) {
 		assert(errno);
 		fuse_reply_err(req, errno);
 	} else {
+		if (do_cache) {
+			uint64_t buf_off = 0;
+			for (uint64_t i = aligned_off; i < (uint64_t)off + size; i += page_size) {
+				trace("cache put nhid_small=%lx off=%lx size=%ld\n", nhid_small, aligned_off, page_size);
+				cachemap_put(cachemap_obj, i, nhid_small, 0, out_buf + buf_off);
+				buf_off += page_size;
+			}
+		}
 		fuse_reply_buf(req, out_buf, (size_t)res);
 	}
 	free(out_buf);
@@ -1136,8 +1210,24 @@ static void edgefs_write(fuse_req_t req, fuse_ino_t ino,
 	res = post_data(url, data, off, size);
 	if (res < 0)
 		fuse_reply_err(req, EIO);
-	else
+	else {
+		uint64_t page_size;
+		uint64_t aligned_off;
+		int do_cache = cachemap_cache_check((uint64_t)off, size, &page_size,
+		    &aligned_off);
+
+		if (do_cache) {
+			uint64_t nhid_small = cachemap_build_nhid(url);
+			uint64_t buf_off = 0;
+			for (uint64_t i = aligned_off; i < (uint64_t)off + size; i += page_size) {
+				trace("cache put nhid_small=%lx off=%lx size=%ld\n", nhid_small, aligned_off, page_size);
+				cachemap_put(cachemap_obj, i, nhid_small, 0, data + buf_off);
+				buf_off += page_size;
+			}
+		}
+
 		fuse_reply_write(req, (size_t)res);
+	}
 }
 
 static void edgefs_release(fuse_req_t req, fuse_ino_t ino,
@@ -1696,6 +1786,11 @@ static void print_url(FILE *f, const struct_url * url)
 	fprintf(f, "protocol: \t%s\n", protocol);
 	fprintf(f, "request path: \t%s\n", url->path);
 	fprintf(f, "auth data: \t%s\n", url->auth ? "(present)" : "(null)");
+	if (cachemap_obj) {
+		fprintf(f, "cachemap dir: \t%s\n", cachemapdir);
+		fprintf(f, "cachemap size: \t%ldGB\n", cachemap_size);
+		fprintf(f, "cachemap unit: \t%d\n", 1<<cachemap_pshift);
+	}
 
 	unsigned rcvBufferSize, sndBufferSize;
 	unsigned sockOptSize = sizeof(rcvBufferSize);
@@ -1813,6 +1908,8 @@ static int parse_url(char *_url, struct_url* res, enum url_flags flag)
 #endif
 	res->name = strdup("");
 
+	FNV_hash(res->path, (int)strlen(res->path), &res->bhid_small);
+
 	return res->proto;
 }
 
@@ -1820,8 +1917,9 @@ static void usage(void)
 {
 	fprintf(stderr, "%s >>> Version: %s <<<\n", __FILE__, VERSION);
 	fprintf(stderr, "usage:  %s [-c [console]] "
-	    "[-a file] [-d n] [-5] [-2] [-b bs] [-o order] [-D] [-R] [-S]"
-	    "[-f] [-t timeout] [-r n] url mount-parameters\n\n", argv0);
+	    "[-a file] [-d n] [-5] [-2] [-b bs] [-o order] [-D] [-R] [-S] "
+	    "[-C cachedir] [-s cachesize] [-p cachepshift] [-f] [-t timeout] "
+	    "[-r n] url mount-parameters\n\n", argv0);
 	fprintf(stderr, "\t -2 \tAllow RSA-MD2 server certificate\n");
 	fprintf(stderr, "\t -5 \tAllow RSA-MD5 server certificate\n");
 #if __linux__
@@ -1841,6 +1939,9 @@ static void usage(void)
 	fprintf(stderr, "\t -t \tset socket timeout in seconds (default: %i)\n", TIMEOUT);
 	fprintf(stderr, "\t -k \tset the ACCESS:SECRET for authentication\n");
 	fprintf(stderr, "\t -T \tset the region (default: us-west-1\n");
+	fprintf(stderr, "\t -C \tenable use of local SSD/NVMe devices as L2 extended cache\n");
+	fprintf(stderr, "\t -s \tmaximum L2 extended cache size in GBs (default: %ld)\n", cachemap_size);
+	fprintf(stderr, "\t -p \tL2 extended cache caching unit size in page shift (default: %ld)\n", cachemap_pshift);
 	fprintf(stderr, "\tmount-parameters should include the mount point and FUSE -o parameters\n");
 }
 
@@ -1930,6 +2031,21 @@ int main(int argc, char *argv[])
 			case 'a': main_url.cafile = argv[1];
 				  shift;
 				  break;
+			case 'C': cachemapdir = argv[1];
+				  shift;
+				  break;
+			case 's': if (convert_num((long*)&cachemap_size, argv))
+					  return 4;
+				  if (cachemap_size < 1 || cachemap_size > 132*1024L)
+					  return 4;
+				  shift;
+				  break;
+			case 'p': if (convert_num(&cachemap_pshift, argv))
+					  return 4;
+				  if (cachemap_pshift < 12 || cachemap_pshift > 17)
+					  return 4;
+				  shift;
+				  break;
 			case 'D': main_url.direct_io = 1;
 				  break;
 			case 'd': if (convert_num(&main_url.log_level, argv))
@@ -1994,6 +2110,17 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "invalid url: %s\n", argv[1]);
 		return 2;
 	}
+
+	if (cachemapdir) {
+		cachemap_obj = cachemap_create(cachemapdir,
+		    ((uint64_t)cachemap_size * 1024UL*1024UL*1024UL)>>cachemap_pshift,
+		    cachemap_accel, (int)cachemap_pshift);
+		if (!cachemap_obj) {
+			fprintf(stderr, "cachemap initialization error\n");
+			return 4;
+		}
+	}
+
 	int sockfd = open_client_socket(&main_url);
 	if (sockfd < 0) {
 		fprintf(stderr, "Connection failed.\n");
