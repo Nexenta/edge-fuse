@@ -48,16 +48,17 @@ intermediates += $(addsuffix .xml,$(manpages))
 
 targets = $(binaries) $(manpages)
 
-all: libcachemap.so $(targets)
+all: libcachemap.so.0.0 $(targets)
 
 cachemap:
 	mkdir -p $@
 
-libcachemap.so: cachemap
+libcachemap.so.0.0: cachemap
 	$(MAKE) -C cachemap
-	ln -sf cachemap/libcachemap.so libcachemap.so
+	ln -sf cachemap/libcachemap.so.0.0 libcachemap.so.0.0
+	ln -sf cachemap/libcachemap.so.0.0 libcachemap.so
 
-edgefs: libcachemap.so edgefs.c
+edgefs: libcachemap.so.0.0 edgefs.c
 	$(CC) $(MAIN_CPPFLAGS) $(CPPFLAGS) $(MAIN_CFLAGS) $(CFLAGS) edgefs.c $(MAIN_LDFLAGS) $(THR_LDFLAGS) $(LDFLAGS) -o $@
 
 edgefs%.1: edgefs.1
@@ -65,7 +66,7 @@ edgefs%.1: edgefs.1
 
 clean:
 	make -C cachemap clean
-	rm -f libcachemap.so
+	rm -f libcachemap.so*
 	rm -f $(targets) $(intermediates)
 	rm -rf ./$(pkg_dir) ./BUILD ./BUILDROOT ./RPMS ./SOURCES ./SPECS ./SRPMS
 

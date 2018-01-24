@@ -1,4 +1,4 @@
-TARGET_LIB = libcachemap.so
+TARGET_LIB = libcachemap.so.0.0
 TARGET_SRCS = mdb.c midl.c lz4.c filemap.c cachemap.c
 #
 # Activate by exporing this env variable:
@@ -17,6 +17,8 @@ all: ${TARGET_LIB} cachemap_test
 
 $(TARGET_LIB): $(TARGET_OBJS)
 	gcc -shared -o $@ $^ $(LDFLAGS)
+	gcc -shared -Wl,-soname,$(TARGET_LIB) $^ $(LDFLAGS) -o $@
+	ln -sf libcachemap.so.0.0 libcachemap.so
 
 cachemap_test: cachemap_test.c $(TARGET_LIB)
 	gcc $(CFLAGS) -o $@ $^ -lcachemap
@@ -25,4 +27,4 @@ pktrecv: pktrecv.c $(TARGET_LIB)
 	gcc $(CFLAGS) -o $@ $^ -lcachemap
 
 clean:
-	rm -f $(TARGET_LIB) cachemap_test *.o
+	rm -f $(TARGET_LIB) cachemap_test *.o *.so
