@@ -89,7 +89,7 @@
 #define MAX_REDIRECTS 32
 #define TNAME_LEN 13
 #define RESET_RETRIES 8
-#define VERSION "1.0.1 \"Edge-X API client\""
+#define VERSION "1.1.0 \"Edge-X API client\""
 #define BUCKET_MAX 1000000
 
 enum sock_state {

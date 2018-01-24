@@ -1,3 +1,9 @@
+1.1.0 / 01/24/2018
+==================
+
+  * support for L2 extended cache on SSD/NVMe
+  * bug fixes
+
 1.0.1 / 11/13/2017
 ==================
 
