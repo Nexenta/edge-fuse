@@ -7,7 +7,7 @@ TARGET_SRCS = mdb.c midl.c lz4.c filemap.c cachemap.c
 #
 #ASAN_CPPFLAGS=-fsanitize=address -fno-omit-frame-pointer -fno-common
 #ASAN_LDFLAGS=-fsanitize=address -fno-omit-frame-pointer -fno-common -lasan
-CFLAGS += -fPIC -Wall -Wextra -Wno-unused -O3 -pthread -g -I. -L. $(ASAN_CPPFLAGS)
+CFLAGS += -std=c99 -D_FILE_OFFSET_BITS=64 -fPIC -Wall -Wextra -Wno-unused -O3 -pthread -g -D_XOPEN_SOURCE=700 -D_ISOC99_SOURCE -I. -L. $(ASAN_CPPFLAGS)
 LDFLAGS += -L. $(ASAN_LDFLAGS)
 
 TARGET_OBJS = $(TARGET_SRCS:.c=.o)

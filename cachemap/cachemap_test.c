@@ -51,7 +51,7 @@ test(char *destdir)
 	}
 	t2 = clock();
 
-	usleep(1000000);
+	sleep(1);
 
 	printf("Inserted %d objects in %.6fs\n", MAXOBJ, ((double)(t2-t1))/CLOCKS_PER_SEC);
 	cachemap_print_stats(cm);

@@ -13,7 +13,7 @@ DISTID := $(shell echo $$(. /etc/os-release; echo $$ID | tr '[A-Z]' '[a-z]'))
 
 ifeq ($(UNAME), Darwin)
 
-MAIN_CFLAGS :=  -g -O2 -Wall -std=c99 -D_FILE_OFFSET_BITS=64 $(ASAN_CPPFLAGS)
+MAIN_CFLAGS :=  -g -O2 -Wall -std=c99 -D_FILE_OFFSET_BITS=64 -Icachemap $(ASAN_CPPFLAGS)
 CC = gcc
 CFLAGS += -I/usr/local/opt/openssl/include
 LDFLAGS := -lgnutls -lfuse
@@ -21,7 +21,7 @@ MAIN_LDFLAGS := -L. -lcachemap
 
 else
 
-MAIN_CFLAGS :=  -g -O2 -Wall -std=c99 $(shell pkg-config fuse --cflags) $(ASAN_CPPFLAGS)
+MAIN_CFLAGS :=  -g -O2 -Wall -std=c99 -Icachemap $(shell pkg-config fuse --cflags) $(ASAN_CPPFLAGS)
 MAIN_CPPFLAGS := -Wall -Wno-unused-function -Wconversion -Wtype-limits -DUSE_AUTH -D_XOPEN_SOURCE=700 -D_ISOC99_SOURCE $(ASAN_LDFLAGS)
 THR_LDFLAGS := -lpthread
 GNUTLS_VERSION := 2.10
