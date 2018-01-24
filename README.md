@@ -1,6 +1,6 @@
 # NexentaEdge Edge-X S3 POSIX compatible file system
 
-High-Performance FUSE library for Edge-X S3 API.
+High-Performance FUSE library to access Edge-X S3 API.
 
 Tested and supported platforms:
 
@@ -12,9 +12,10 @@ Tested and supported platforms:
 NexentaEdge Extended S3 API provides unique benefits which can be useful for Machine Deep Learning, Big Data and IoT frameworks:
 
 * Mount S3 objects for fast File/POSIX access avoid unnecessary copy, fetch only needed datasets
+* Optimized for local acces with fast Level-2 cache on SSD/NVMe
 * Extended S3 feature set: Append, Range Writes, Object/Bucket snapshots, Key-Value Object access
 * Data Reduction with global inline de-duplication, compression and erasure encoding
-* Cost Reduction File/Block/DB access with S3 economics 
+* Cost Reduction File/Block/DB access with S3 economics
 
 ## Use cases details
 
