@@ -105,7 +105,7 @@ cachemap_thread(void *arg)
 }
 
 struct cachemap *
-cachemap_create(char *destdir, int capacity, int comp_accel, int pshift)
+cachemap_create(char *destdir, uint64_t capacity, int comp_accel, int pshift)
 {
 	struct stat sb;
 	int err;
@@ -185,20 +185,20 @@ cachemap_get(struct cachemap *cm, uint64_t offset, uint64_t nhid_small,
 
 void
 cachemap_put(struct cachemap *cm, uint64_t offset, uint64_t nhid_small,
-    uint32_t genid, void *page)
+    uint32_t genid, const void *page)
 {
 	struct addr_work work;
 	if (to_uint128_addr(cm, offset, nhid_small, genid, &work.addr) != 0)
 		return;
 
-	work.page = page;
+	work.page = (char*)page;
 	work.ts = get_time_ns();
 	cachemap_put_work(cm, &work);
 }
 
 void
 cachemap_put_async(struct cachemap *cm, uint64_t offset, uint64_t nhid_small,
-    uint32_t genid, void *page)
+    uint32_t genid, const void *page)
 {
 	struct addr_work work;
 	if (to_uint128_addr(cm, offset, nhid_small, genid, &work.addr) != 0)

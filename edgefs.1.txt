@@ -98,6 +98,12 @@ V4 AUTH OPTIONS
 *-T 'region'*::
     Use specific S3 region. The default is us-west-1
 
+L2 SSD/NVMe cache
+~~~~~~~~~~~~~~~~~
+
+*-C 'cachedir'*::
+    Enable use of local SSD/NVMe devices as high-performance block level cache.
+
 *'FUSE-OPTIONS'*
 ~~~~~~~~~~~~~~~~
 These options are passed to the *FUSE* library. At the very least the mount point should be specified.

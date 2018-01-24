@@ -11,7 +11,7 @@ struct data_prefix {
 	int compressed_length;
 };
 
-#define DEBUG_ON	1
+#define DEBUG_ON	0
 #define DBG_TRACE() \
 	if (DEBUG_ON) printf("%s:%d : err %d\n", __func__, __LINE__, err)
 
@@ -116,14 +116,14 @@ filemap_set(struct filemap *m, uint128_t *addr, void *value, uint64_t attr)
 	uint64_t key;
 	MDB_env *env = filemap_get_shard(m, addr, &key);
 	MDB_txn *txn = NULL;
-	char dest[m->bsize + 128];
+	char dest[m->bsize + 1024];
 	int actual;
 	char *value_ptr;
 	size_t value_size;
 
 	if (m->compress) {
 		/* compress outside of transaction to keep it scope short */
-		actual = LZ4_compress_fast(value, &dest[0], m->bsize, m->bsize + 128,
+		actual = LZ4_compress_fast(value, &dest[0], m->bsize, m->bsize + 1024,
 		    m->compress);
 		value_ptr = &dest[0];
 		value_size = actual;

@@ -30,8 +30,8 @@ struct cachemap {
 	uint64_t hits;
 };
 
-struct cachemap * cachemap_create (char *destdir, int capacity, int comp_accel,
-    int bsize);
+struct cachemap * cachemap_create (char *destdir, uint64_t capacity, int comp_accel,
+    int pshift);
 
 void cachemap_free(struct cachemap *cm);
 
@@ -39,10 +39,10 @@ void * cachemap_get(struct cachemap *cm, uint64_t offset,
     uint64_t nhid_small, uint32_t genid);
 
 void cachemap_put(struct cachemap *cm, uint64_t offset,
-    uint64_t nhid_small, uint32_t genid, void *page);
+    uint64_t nhid_small, uint32_t genid, const void *page);
 
 void cachemap_put_async(struct cachemap *cm, uint64_t offset,
-    uint64_t nhid_small, uint32_t genid, void *page);
+    uint64_t nhid_small, uint32_t genid, const void *page);
 
 void cachemap_print_stats(struct cachemap *cm);
 

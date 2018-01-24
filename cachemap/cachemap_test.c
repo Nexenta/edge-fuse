@@ -5,9 +5,9 @@
 
 #include "cachemap.h"
 
-#define MAXOBJ 10*32768
-#define COMP_ACCEL 8
-#define PAGE_SHIFT 14
+#define MAXOBJ 32768
+#define COMP_ACCEL 12
+#define PAGE_SHIFT 15
 #define PAGE_SIZE (1<<PAGE_SHIFT)
 
 struct obj {

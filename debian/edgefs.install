@@ -1,2 +1,3 @@
 #!/usr/bin/dh-exec
 edgefs => /usr/bin/edgefs
+cachemap/libcachemap.so => /usr/lib/libcachemap.so

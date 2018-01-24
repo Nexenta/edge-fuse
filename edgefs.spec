@@ -35,11 +35,13 @@ make %{?_smp_mflags} all
 mkdir -p %{buildroot}%{_bindir}
 mkdir -p %{buildroot}%{_mandir}/man1
 cp edgefs %{buildroot}%{_bindir}/
+cp cachemap/libcachemap.so %{buildroot}%{_libdir}/libcachemap.so
 cp edgefs.1 %{buildroot}%{_mandir}/man1/
 
 
 %files
 %{_bindir}/edgefs
+%{_libdir}/libcachemap.so
 %{_mandir}/man1/edgefs.1*
 %doc README.md
 
