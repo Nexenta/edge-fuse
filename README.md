@@ -33,7 +33,7 @@ Comparision to existing cloud object storage APIs:
 
 Give Edge-X S3 a try in easy to run single command installation:
 
-```console
+```bash
 # location where to keep blobs
 mkdir /var/tmp/data
     
@@ -50,7 +50,7 @@ Follow up with our Community! Please join us at the [NexentaEdge Devops communit
 
 The following are the steps to initialize, setup region namespace, tenant, service:
     
-```console
+```bash
 # setup alias for easy CLI style management
 alias neadm="docker exec -it s3data neadm"
     
@@ -78,7 +78,7 @@ curl http://172.17.0.3:9982
 
 Setup GUI for easy on-going management and monitoring:
 
-```console
+```bash
 docker run -e API_ENDPOINT=http://172.17.0.3:8080 -p 3000:3000 \
     nexenta/nedgeui:2.1.0
 ```
@@ -95,25 +95,25 @@ While mounted, objects remain versioned, searchable and globally accessible (mul
 
 ## Compile edgefs binary
 
-```console
+```bash
 make all
 ```
 
 ## Build Debian package
 
-```console
+```bash
 make deb
 ```
 
 ## Build RPM package
 
-```console
+```bash
 make rpm
 ```
 
 ## Install package or binary and mount bucket
 
-```console
+```bash
 mkdir /mnt/bk1
 edgefs -c - -f http://172.17.0.3:9982/bk1 /mnt/bk1
 ```
@@ -124,7 +124,7 @@ At this point EdgeFS module emulates POSIX access to S3 bucket and would use Ext
 
 Build fstest utility and execute TAP tests from the mount point, example:
 
-```console
+```bash
 cd /mnt/bk1
 prove -r /path/to/edge-fuse/tests
 ```
